@@ -3,6 +3,18 @@
 日期：2019/5/9
 """
 
+import torch
+
+def maybe_pad_or_slice(tensor, desired_length):
+    ### 将 tensor 第 0 个维度调整至 desired_length 5/23
+    length = list(tensor.shape)[0]
+    if length < desired_length:
+        paddings = torch.zeros(size=[desired_length - length]+list(tensor.shape[1:]))
+        tensor = torch.cat((tensor, paddings), dim=0)
+    elif length > desired_length:
+        tensor = tensor[:desired_length]
+    assert tensor.shape[0] == desired_length
+    return tensor
 
 
 def with_flat_batch(flat_batch_fn, ndims=4):

@@ -1,12 +1,18 @@
 # 作者：李溢
 # 日期：2019/5/6
 
+import collections
 import functools
+import itertools
+from collections import OrderedDict
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+
+from video_prediction.utils.util import maybe_pad_or_slice
 from video_prediction.utils.max_sv import spectral_normed_weight
 from video_prediction.layers.conv import Conv2d, Conv3d
 
@@ -235,15 +241,6 @@ class VideoDiscriminator(nn.Module):
         return outputs
     
 ### 编写于5/15
-'''
-        if hparams.use_e_rnn:
-            self.dense0 = Dense(input_shape, units=hparams.nef * 4)
-            if hparams.rnn == 'lstm':
-                self.rnn = nn.LSTM(hidden_size=hparams.nef * 4)
-            elif hparams.rnn == 'gru':
-                self.rnn = nn.GRU(hidden_size=hparams.nef * 4)
-            else:
-                raise NotImplementedError'''   ### 暂时去掉 5/19
 class Posterior(nn.Module):
     ### 测试后基本没问题 5/22
     ### input 为 DNCHW 5/19
@@ -253,10 +250,19 @@ class Posterior(nn.Module):
         super(Posterior, self).__init__()
         self.input_shape = list(input_shape)
         self.use_e_rnn = hparams.use_e_rnn  ### 默认false 5/19
-        
-        self.encoder = Encoder(input_shape=[np.prod(self.input_shape[0:2])]+
-                               [self.input_shape[-3]*2]+self.input_shape[-2:],
-                               nef=hparams.nef, n_layers=hparams.n_layers)
+        encoder_input_shape = [np.prod(self.input_shape[0:2])]+[self.input_shape[-3]*2]+self.input_shape[-2:]
+        self.encoder = Encoder(input_shape=encoder_input_shape,
+                               nef=hparams.nef,
+                               n_layers=hparams.n_layers)
+        '''
+        if hparams.use_e_rnn:
+            self.dense0 = Dense(input_shape, units=hparams.nef * 4)
+            if hparams.rnn == 'lstm':
+                self.rnn = nn.LSTM(hidden_size=hparams.nef * 4)
+            elif hparams.rnn == 'gru':
+                self.rnn = nn.GRU(hidden_size=hparams.nef * 4)
+            else:
+                raise NotImplementedError'''   ### 暂时去掉 5/19
         out_shape = [np.prod(self.input_shape[0:2]),
                      hparams.nef * min(4, 2**(hparams.n_layers-1))]
         self.dense1 = Dense(input_shape=out_shape, units=hparams.nz)  ### input_shape要改 5/15
@@ -281,44 +287,195 @@ class Posterior(nn.Module):
     
     
 class Prior(nn.Module):
+    ### 测试后基本没问题 5/23
+    ### inputs DNCHW 5/23
+    ### outputs (self.concat_shape[0:2],rnn.hidden_size)  5/23
     ### 改写自savp_model.py prior_fn 5/16
+    ### inputs应当是 DNCHW 5/22
     def __init__(self, input_shape, hparams):
         super(Prior, self).__init__()
         self.hparams = hparams
-        self.encoder = Encoder(input_shape, nef=hparams.nef, n_layers=hparams.n_layers)### input_shape需要根据hparmas修改 5/16
-        self.dense0 = Dense(input_shape, units=hparams.nef * 4)
+        self.input_shape = list(input_shape)
+        ## inputs concat 过程中只取了 inputs[:self.hparams.context_frames - 1] 5/22
+        self.concat_shape = [(hparams.context_frames-1)%self.input_shape[0]]+ \
+                            [self.input_shape[1]]+ \
+                            [self.input_shape[-3]*2]+ \
+                            self.input_shape[-2:]
+        encoder_input_shape = [np.prod(self.concat_shape[0:2])]+self.concat_shape[2:]
+        self.encoder = Encoder(input_shape=encoder_input_shape,
+                               nef=hparams.nef,
+                               n_layers=hparams.n_layers)### input_shape需要根据hparmas修改 5/16
+        
+        encoder_out_shape = self.concat_shape[0:2]+ \
+                            [hparams.nef * min(4, 2**(hparams.n_layers-1))]
+        dense_input_shape = encoder_out_shape
+        dense_input_shape[0] += hparams.sequence_length - hparams.context_frames
+        dense_input_shape = [np.prod(dense_input_shape[0:2])] + dense_input_shape[2:]
+        self.dense0 = Dense(input_shape=dense_input_shape, units=hparams.nef * 4)
+        
+        ### lstm input 应为 (seq_len, batch, input_size) 5/22
+        rnn_input_shape = self.concat_shape[0:2]+[hparams.nef * 4]
         if hparams.rnn == 'lstm':
-            self.rnn = nn.LSTM(hidden_size=hparams.nef * 4)
+            # input_size: The number of expected features in the input x 5/23
+            # inputs: input, (h_0, c_0)
+            #         input of shape=(seq_len, batch, input_size) 5/23
+            # outputs: output, (h_n, c_n) 5/23
+            #          output of shape (seq_len, batch, num_directions * hidden_size) 5/23
+            self.rnn = nn.LSTM(input_size=hparams.nef * 4, hidden_size=hparams.nef * 4)
         elif hparams.rnn == 'gru':
-            self.rnn = nn.GRU(hidden_size=hparams.nef * 4)
+            self.rnn = nn.GRU(input_size=hparams.nef * 4, hidden_size=hparams.nef * 4)
         else:
             raise NotImplementedError
-        self.dense1 = Dense(input_shape=hparams.nef*4, units=hparams.nz)  ### input_shape要改 5/16
-        self.dense2 = Dense(input_shape=hparams.nef*4, units=hparams.nz)  ### input_shape要改 5/16
+        rnn_output_shape = self.concat_shape[0:2]+[hparams.nef * 4]
+        dense_input_shape = [np.prod(rnn_output_shape[0:2])] + rnn_output_shape[2:]
+        self.dense1 = Dense(input_shape=dense_input_shape, units=hparams.nz)  ### input_shape要改 5/16
+        self.dense2 = Dense(input_shape=dense_input_shape, units=hparams.nz)  ### input_shape要改 5/16
         
-    def forward(inputs):
-        ### inputs应当是 NCHW 5/16
+    def forward(self, inputs):
+        ### inputs应当是 DNCHW 5/22
         outputs = {}
         ### 将连续的两帧图片在channel维度上级联 5/16
         ### context_frams 需要根据 ... 5/16
-        inputs = torch.cat([inputs[:self.hparams.context_frames - 1], inputs[1:self.hparams.context_frames]], dim=-3)  
+        inputs = torch.cat([inputs[:self.hparams.context_frames - 1],
+                            inputs[1:self.hparams.context_frames]], dim=-3)  
+        inputs = inputs.reshape([-1]+list(inputs.shape[-3:]))  ### 变为 NCHW 5/23
         ### 加入 action uncompleted ... 
-        h = self.encoder(inputs)
-        h_zeros = torch.zeros(sizes = torch.cat(
-            [[self.hparams.sequence_length - self.hparams.context_frames], h.size[1:]], axis=0))
+        h = self.encoder(inputs)['output']
+        h = h.reshape(self.concat_shape[0:2]+[-1])
         
-        h = torch.cat([h, h_zeros], axis=0)
+        h_zeros = torch.zeros(size=[self.hparams.sequence_length-self.hparams.context_frames]+list(h.shape[1:]))
+        h = torch.cat([h, h_zeros], dim=0)
+        
+        h = h.reshape([-1, h.size(-1)])
         h = self.dense0(h)
-        h = self.rnn(h)
-        z_mu = self.dense1(h)
+        h = h.reshape(self.concat_shape[0:2]+[-1])
+        h = self.rnn(h)[0]
+        
+        h = h.reshape([-1, h.size(-1)])
+        z_mu = self.dense1(h).reshape(self.concat_shape[0:2]+[-1])
         outputs['z_mu'] = z_mu
-        z_log_sigma_sq = self.dense2(h)
+        z_log_sigma_sq = self.dense2(h).reshape(self.concat_shape[0:2]+[-1])
         z_log_sigma_sq = torch.clamp(z_log_sigma_sq, -10,10)
         outputs['z_log_sigma_sq'] = z_log_sigma_sq
         return outputs
         
-    
+
+### 编写于 5/23
+class GeneratorGivenZ(nn.Module):
+    ### inputs 是一个 dict 5/23
+    ### keys() = ['images', 'zs'] 5/23
+    def __init__(self, input_shape, mode, hparams):
+        super(GeneratorGivenZ, self).__init__()
+        self.input_shape = input_shape
+        self.hparams = hparams
+        self.mode = mode
+        
+        ### uncompleted。。。 5/23
+        
+        
+    def forward(self, inputs):
+        inputs = {name: maybe_pad_or_slice(input, self.hparams.sequence_length - 1)
+              for name, input in inputs.items()}
+        ### 未完待续。。。 5/23
+
+
+### 编写于 5/23
+### 待测试。。。 5/23
 class Generator(nn.Module):
-    def __init__(self):
+    ### inputs DNCHW 5/23
+    def __init__(self, input_shape, mode, hparams):
         super(Generator, self).__init__()
+        self.mode = mode
+        self.hparams = hparams
+        self.input_shape = input_shape
+        self.batch_size = input_shape[1]
+        
+        self.zs_shape = [hparams.sequence_length - 1, self.batch_size, hparams.nz]
+        self.encoder = Posterior(input_shape, hparams)
+        if hparams.learn_prior:
+            self.prior = Prior(input_shape, hparams)
+        else:
+            self.prior = None
+        self.generator = GeneratorGivenZ(input_shape = posterior_shape, mode, hparams)  ### 待完成 5/23
+        
+    def forward(self, images):
+        inputs = {}
+        inputs['images'] = images
+        if self.hparams.nz == 0:
+            outputs = self.generator(inputs)
+        else:
+            ### encoder 生成 posterior  5/23
+            outputs_posterior = self.encoder(inputs['images'])
+            eps = torch.randn(self.zs_shape)
+            zs_posterior = outputs_posterior['zs_mu'] + \
+                    torch.sqrt(torch.exp(outputs_posterior['zs_log_sigma_sq'])) * eps
+            inputs_posterior = inputs
+            inputs_posterior['zs'] = zs_posterior
+            
+            ### 生成 prior 5/23
+            if self.hparams.learn_prior:
+                outputs_prior = self.prior(inputs['images'])
+                eps = torch.randn(self.zs_shape)
+                zs_prior = outputs_prior['zs_mu'] + \
+                    torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq'])) * eps
+            else:
+                outputs_prior = {}
+                zs_prior = torch.randn([self.hparams.sequence_length - self.hparams.context_frames] + \
+                                       self.zs_shape[1:])
+                zs_prior = torch.cat([zs_posterior[:self.hparams.context_frames - 1], zs_prior], dim=0)
+            inputs_prior = inputs
+            inputs_prior['zs'] = zs_prior
+            
+            ### posterior 和 images 交给 generator 5/23
+            gen_outputs_posterior = self.generator(inputs_posterior)
+            gen_outputs = self.generator(inputs_prior)
+            
+            # rename tensors to avoid name collisions
+            output_prior = collections.OrderedDict([(k + '_prior', v) for k, v in outputs_prior.items()])
+            outputs_posterior = collections.OrderedDict([(k + '_enc', v) for k, v in outputs_posterior.items()])
+            gen_outputs_posterior = collections.OrderedDict([(k + '_enc', v) for k, v in gen_outputs_posterior.items()])
+            
+            outputs = [output_prior, gen_outputs, outputs_posterior, gen_outputs_posterior]
+            total_num_outputs = sum([len(output) for output in outputs])
+            ### 整合 5/23
+            outputs = collections.OrderedDict(itertools.chain(*[output.items() for output in outputs]))
+            assert len(outputs) == total_num_outputs  # ensure no output is lost because of repeated keys
+
+            ### 根据 prior 生成多个随机抽样 5/23
+            ### num_samples 是采样的个数 5/23
+            inputs_samples = {
+                name: torch.repeat(input[:, None], [1, self.hparams.num_samples]+[1]*(input.shape.ndims - 1))
+                for name, input in inputs.items()}
+            zs_samples_shape = [self.hparams.sequence_length - 1,
+                                self.hparams.num_samples,
+                                self.batch_size,
+                                self.hparams.nz]
+            if self.hparam.learn_prior:
+                eps = torch.randn(zs_samples_shape)
+                zs_prior_samples = (outputs_prior['zs_mu'][:, None] +
+                                torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq']))[:, None] * eps)
+            else:
+                zs_prior_samples = torch.randn(
+                    [self.hparams.sequence_length - self.hparams.context_frames] + zs_samples_shape[1:])
+                zs_prior_samples = torch.cat(
+                    [torch.repeat(zs_posterior[:self.hparams.context_frames - 1][:, None],
+                                  [1, self.hparams.num_samples, 1, 1]),
+                     zs_prior_samples], dim=0)
+            inputs_prior_samples = dict(inputs_samples)
+            inputs_prior_samples['zs'] = zs_prior_samples
+            
+            ### 第1，2个维度压平 5/23
+            inputs_prior_samples = {name: torch.flatten(input, start_dim=1, end_dim=2)
+                                    for name, input in inputs_prior_samples.items()}
+            gen_outputs_samples = self.generator(inputs_prior_samples)
+            gen_images_samples = gen_outputs_samples['gen_images']
+            ### 再恢复出前两个维度 5/23
+            gen_images_samples = torch.stack(gen_images_samples.chunk(self.hparams.num_samples, dim=1), dim=-1)
+            gen_images_samples_avg = torch.mean(gen_images_samples, dim=-1)
+            outputs['gen_images_samples'] = gen_images_samples
+            outputs['gen_images_samples_avg'] = gen_images_samples_avg
+        
+        return outputs
+
+            
         
