@@ -361,6 +361,7 @@ class Prior(nn.Module):
         
 
 ### 编写于 5/23
+### 待测试。。。
 class GeneratorGivenZ(nn.Module):
     ### inputs 是一个 dict 5/23
     ### keys() = ['images', 'zs'] 5/23

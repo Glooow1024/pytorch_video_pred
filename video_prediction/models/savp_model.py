@@ -14,6 +14,150 @@ from collections import OrderedDict
 from tensorflow.contrib.training import HParams
 from video_prediction.utils.max_sv import spectral_normed_weight
 from video_prediction.layers.conv import Conv2d, Conv3d
+from video_prediction.layers.convLSTM import ConvLSTMCell
+
+
+class SAVPCell(nn.Module):
+    ### 假定 input_shape={'images':NCHW, 'zs':(N,nz)} 5/27
+    ### 假定这里的 images 和 zs 都是经过 unroll_rnn 拆分过的 5/27
+    def __init__(self, input_shape, mode, hparams):
+        super(SAVPCell, self).__init__()
+        self.mode = mode
+        self.hparams = hparams
+        self.input_shape = input_shape  ### 设定为一个dict 5/23
+        self.batch_size = input_shape['images'].shape[0]   ### images.shape=NCHW 5/23
+        self.image_shape = list(input_shape['images'].shape[-3:])
+        channel, height, width = self.image_shape
+        self.time = 0
+        self.scale_size = min(height, width)
+        if self.scale_size >= 256:
+            ### 待完成.。。。 5/23
+            raise NotImplementedError
+        elif self.scale_size >=128:
+            ### encoder 5/26
+            ### savp_model #523 5/26
+            conv_rnn_height, conv_rnn_width = height, width
+            self.encoder = nn.ModuleList()
+            ### 第 0 层 5/26
+            ### conv_pool + norm + activation 5/26
+            ### 未完待续。。。 5/26
+            conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
+            self.encoder += nn.Conv2d()
+            self.encoder += nn.AvgPool2d()
+            self.encoder += nn.InstanceNorm2d()
+            self.encoder += nn.ReLU()
+            ### 第 1 层 5/26
+            conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
+            self.encoder += nn.Conv2d()
+            self.encoder += nn.AvgPool2d()
+            self.encoder += nn.InstanceNorm2d()
+            self.encoder += nn.ReLU()
+            self.encoder += ConvLSTMCell()
+            ### 第 2 层 5/26
+            conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
+            self.encoder += nn.Conv2d()
+            self.encoder += nn.AvgPool2d()
+            self.encoder += nn.InstanceNorm2d()
+            self.encoder += nn.ReLU()
+            self.encoder += ConvLSTMCell()
+            ### 第 3 层 5/26
+            conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
+            self.encoder += nn.Conv2d()
+            self.encoder += nn.AvgPool2d()
+            self.encoder += nn.InstanceNorm2d()
+            self.encoder += nn.ReLU()
+            self.encoder += ConvLSTMCell()
+            
+            self.encoder_0 = [nn.ConvLSTMCell(input_size=(conv_rnn_height, conv_rnn_width),
+                                             input_dim=channel,
+                                             hidden_dim=self.hparmas.ngf,
+                                             kernel_size=(5,5),
+                                             bias=True)]
+            
+            ### decoder 5/26
+            self.decoder = nn.ModuleList()
+            ### 第 0 层 5/27
+            conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
+            self.decoder += nn.Upsample(mode='bilinear')
+            self.decoder += nn.Conv2d()
+            self.decoder += nn.InstanceNorm2d()
+            self.decoder += nn.ReLU()
+            self.decoder += ConvLSTMCell()
+            ### 第 1 层 5/27
+            conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
+            self.decoder += nn.Upsample(mode='bilinear')
+            self.decoder += nn.Conv2d()
+            self.decoder += nn.InstanceNorm2d()
+            self.decoder += nn.ReLU()
+            self.decoder += ConvLSTMCell()
+            ### 第 2 层 5/27
+            conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
+            self.decoder += nn.Upsample(mode='bilinear')
+            self.decoder += nn.Conv2d()
+            self.decoder += nn.InstanceNorm2d()
+            self.decoder += nn.ReLU()
+            ### 第 3 层 5/27
+            conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
+            self.decoder += nn.Upsample(mode='bilinear')
+            self.decoder += nn.Conv2d()
+            self.decoder += nn.InstanceNorm2d()
+            self.decoder += nn.ReLU()
+            
+            ### for cdna kernel, 忽略其他transformation 5/27
+            self.cdna = Dense()
+            
+            ### scratch_images 5/27
+            self.scratch_h = nn.ModuleList()
+            self.scratch_h += nn.Conv2d()
+            self.scratch_h += nn.InstanceNorm2d()
+            self.scratch_h += nn.ReLU()
+            
+            self.scratch_img = nn.ModuleList()
+            self.scratch_img += nn.Conv2d()
+            self.scratch_img += nn.Sigmoid()
+            
+            ### masks 5/27
+            self.masks_h = nn.ModuleList()
+            self.masks_h += nn.Conv2d()
+            self.masks_h += nn.InstanceNorm2d()
+            self.masks_h += nn.ReLU()
+            
+            self.masks = nn.ModuleList()
+            self.masks += nn.Conv2d()
+            self.masks += nn.Softmax()
+            
+            
+            
+            self.encoder_layer_specs = [
+                (self.hparams.ngf, False),
+                (self.hparams.ngf * 2, True),
+                (self.hparams.ngf * 4, True),
+                (self.hparams.ngf * 8, True),
+            ]
+            self.decoder_layer_specs = [
+                (self.hparams.ngf * 8, True),
+                (self.hparams.ngf * 4, True),
+                (self.hparams.ngf * 2, False),
+                (self.hparams.ngf, False),
+            ]
+        else:
+            ### 待完成.。。。 5/23
+            raise NotImplementedError
+        
+        
+        self.num_masks = self.hparams.last_frames * self.hparams.num_transformed_images + \
+            int(bool(self.hparams.prev_image_background)) + \
+            int(bool(self.hparams.first_image_background and not self.hparams.context_images_background)) + \
+            int(bool(self.hparams.last_image_background and not self.hparams.context_images_background)) + \
+            int(bool(self.hparams.last_context_image_background and not self.hparams.context_images_background)) + \
+            (self.hparams.context_frames if self.hparams.context_images_background else 0) + \
+            int(bool(self.hparams.generate_scratch_image))
+        
+        
+    def forward(inputs):
+        t = self.time
+        
+        
 
 
 ### 融合BaseVideoPredModel 和 VideoPredModel 5/15

@@ -45,7 +45,7 @@ class ConvLSTMCell(nn.Module):
                               bias=self.bias)
 
     def forward(self, input_tensor, cur_state):
-        
+        ### input_tensor 应当是 NCHW 5/26
         h_cur, c_cur = cur_state
         
         combined = torch.cat([input_tensor, h_cur], dim=1)  # concatenate along channel axis
