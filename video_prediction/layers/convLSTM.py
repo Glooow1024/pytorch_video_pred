@@ -10,7 +10,7 @@ import torch
 
 class ConvLSTMCell(nn.Module):
 
-    def __init__(self, input_size, input_dim, hidden_dim, kernel_size, bias):
+    def __init__(self, input_size, input_dim, hidden_dim, kernel_size=(5,5), bias=True):
         """
         Initialize ConvLSTM cell.
         
