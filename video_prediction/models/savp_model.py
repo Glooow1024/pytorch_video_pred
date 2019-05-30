@@ -28,10 +28,11 @@ class SAVPCell(nn.Module):
         self.input_shape = input_shape  ### 设定为一个dict 5/23
         self.batch_size = input_shape['images'].shape[0]   ### images.shape=NCHW 5/23
         self.image_shape = list(input_shape['images'].shape[-3:])
-        channel, height, width = self.image_shape
+        color_channel, height, width = self.image_shape
         self.num_encoder_layers = 4
         self.time = 0
         
+        ############### latent code ###############
         ### LSTMCell inputs 应当是 (batch_size,input_size) 5/28
         self.lstm_z = nn.LSTMCell(input_size=self.input_shape['zs'].shape[1], hidden_size=self.hparams.nz)
         
@@ -39,7 +40,7 @@ class SAVPCell(nn.Module):
         if self.scale_size >= 256:
             raise NotImplementedError
         elif self.scale_size >=128:
-            ### encoder 5/26
+            ############### encoder ###############
             ### savp_model #523 5/26
             conv_rnn_height, conv_rnn_width = height, width
             ### 第 0 层 5/26
@@ -115,7 +116,7 @@ class SAVPCell(nn.Module):
             self.cdna_dense_in_channel = out_channel * conv_rnn_height * conv_rnn_width
             
             
-            ### decoder 5/26
+            ############### decoder ###############
             self.decoder = nn.ModuleList()
             ### 第 0 层 5/27
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
@@ -185,33 +186,38 @@ class SAVPCell(nn.Module):
         else:
             raise NotImplementedError
         
+        ############### cdna kernel ###############
         ### for cdna kernel, 忽略其他transformation 5/27
         self.cdna_kernel_shape = list(self.hparams.kernel_size) + \
                     [self.hparams.last_frames * self.hparams.num_transformed_images]
         self.cdna = Dense(input_shape=[self.batch_size, self.cdna_dense_in_channel],
                           units=torch.prod(self.cdna_kernel_shape))  ### Dense 的 input_shape 要改？ 5/29
         
-        ### scratch_images 5/27
+        ############### scratch_images ###############
+        in_channel = out_channel   ### 来自 decoder 最后一层的输出 h 5/30
+        out_channel = self.hparams.ngf
         self.scratch_h = nn.ModuleList()
-        self.scratch_h += nn.Conv2d()
-        self.scratch_h += nn.InstanceNorm2d()
+        self.scratch_h += nn.Conv2d(
+                        in_channels=in_channel,
+                        out_channels=out_channel,
+                        kernel_size=3,
+                        stride=1,
+                        padding=(1,1))
+        self.scratch_h += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
         self.scratch_h += nn.ReLU()
         
+        in_channel = out_channel
+        out_channel = color_channel
         self.scratch_img = nn.ModuleList()
-        self.scratch_img += nn.Conv2d()
+        self.scratch_img += nn.Conv2d(
+                        in_channels=in_channel,
+                        out_channels=out_channel,
+                        kernel_size=3,
+                        stride=1,
+                        padding=(1,1))
         self.scratch_img += nn.Sigmoid()
         
-        ### masks 5/27
-        self.masks_h = nn.ModuleList()
-        self.masks_h += nn.Conv2d()
-        self.masks_h += nn.InstanceNorm2d()
-        self.masks_h += nn.ReLU()
-        
-        self.masks = nn.ModuleList()
-        self.masks += nn.Conv2d()
-        self.masks += nn.Softmax()
-            
-        
+        ############### masks ###############
         self.num_masks = self.hparams.last_frames * self.hparams.num_transformed_images + \
             int(bool(self.hparams.prev_image_background)) + \
             int(bool(self.hparams.first_image_background and not self.hparams.context_images_background)) + \
@@ -219,6 +225,32 @@ class SAVPCell(nn.Module):
             int(bool(self.hparams.last_context_image_background and not self.hparams.context_images_background)) + \
             (self.hparams.context_frames if self.hparams.context_images_background else 0) + \
             int(bool(self.hparams.generate_scratch_image))
+        
+        in_channel = self.hparams.ngf    ### 来自 decoder 最后一层的输出 h 5/30
+        out_channel = self.hparams.ngf
+        self.masks_h = nn.ModuleList()
+        self.masks_h += nn.Conv2d(
+                        in_channels=in_channel,
+                        out_channels=out_channel,
+                        kernel_size=3,
+                        stride=1,
+                        padding=(1,1))
+        self.masks_h += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
+        self.masks_h += nn.ReLU()
+        
+        ### 认为 num_masks=num_transformed_images
+        in_channel = out_channel + num_maskes * color_channel ### tf.concat([h_masks] + transformed_images, axis=-1) 5/30
+        out_channel = self.num_masks
+        self.masks = nn.ModuleList()
+        self.masks += nn.Conv2d(
+                        in_channels=in_channel,
+                        out_channels=out_channel,
+                        kernel_size=3,
+                        stride=1,
+                        padding=(1,1))
+        self.masks += nn.Softmax()
+        
+        
         
         
     def forward(inputs, states, all_images):
@@ -318,11 +350,139 @@ class SAVPCell(nn.Module):
         smallest_layer = layers[self.num_encoder_layers - 1][-1]
         cdna_kernels = self.cdna(torch.flatten(smallest_layer, start_dim=1, end_dim=-1))
         cdna_kernels = cdna_kernels.reshape([self.batch_size] + self.cdna_kernel_shape)
+        cdna_kernels = cdna_kernels + identity_kernel(self.hparams.kernel_size)[None, :, :, None]
+        ### cdna_kernels.shape=(batch_size, 5, 5, last_frames * num_transformed_images) 5/30
+        
+        ############### scratch images ###############
+        h_scratch = layers[-1][-1]
+        for layer in self.scratch_h:
+            h_scrath = layer(h_scratch)
+        
+        scratch_image = h_scratch
+        for layer in self.scratch_img:
+            scratch_image = layer(scratch)
+        
+        ############# transformed images #############
+        transformed_images = []
+        transformed_images.extend(apply_kernels(last_images, cdna_kernels, self.hparams.dilation_rate))
+        if self.hparams.prev_image_background:
+            transformed_images.append(image)
+        if self.hparams.first_image_background and not self.hparams.context_images_background:
+            transformed_images.append(all_images[0])
+        if self.hparams.last_image_background and not self.hparams.context_images_background:
+            transformed_images.append(all_images[self.hparams.context_frames - 1])
+        if self.hparams.context_images_background:
+            transformed_images.extend(torch.split(all_images[:self.hparams.context_frames],1,dim=0))
+        if self.hparams.generate_scratch_image:
+            transformed_images.append(scratch_image)
+        
+        ################### mask ###################
+        h_masks = layers[-1][-1]
+        for layer in self.masks_h:
+            h_masks = layer(h_masks)
+        
+        masks = torch.cat([h_masks] + transformed_images, dim=1)  ### channel 维度级联 5/30
+        for layer in self.masks:
+            masks = layer(masks)
+        
+        masks = torch.split(masks, len(transformed_images), dim=1)
+        
+        ############# generate images #############
+        assert len(transformed_images) == len(masks)
+        gen_image = sum([trans_image * mask for tran_image, mask in zip(transformed_images, masks)])
+        
+        ################## output ##################
+        outputs = {'gen_images': gen_image,
+                   'transformed_images': torch.stack(transformed_images, dim=1),
+                   'masks': torch.stack(masks, dim=1)} ### dim 取值 -1？ 5/30 
+        new_states = {'time': time + 1,
+                      'gen_image': gen_image,
+                      'last_images': last_images,
+                      'conv_rnn_states': new_conv_rnn_states}
+        if 'zs' in inputs and self.hparams.use_rnn_z and not self.hparams.ablation_rnn:
+            new_states['rnn_z_state'] = rnn_z_state
+        
+        return outputs, new_states
         
         
         
-        
+### 5/30
+def identity_kernel(kernel_size):
+    ### kernel 中心为1或0.25，其余为0，有什么用？ 5/19
+    kh, kw = kernel_size
+    kernel = np.zeros(kernel_size)
 
+    def center_slice(k):
+        if k % 2 == 0:
+            ### 只有最中心的4个点为0.25 5/26
+            return slice(k // 2 - 1, k // 2 + 1)
+        else:
+            ### 只有最中心的一个点 k//2 处为1.0 5/26
+            return slice(k // 2, k // 2 + 1)
+
+    kernel[center_slice(kh), center_slice(kw)] = 1.0
+    kernel /= np.sum(kernel)
+    return kernel
+        
+def apply_kernels(image, kernels, dilation_rate=(1, 1)):
+    """
+    Args:
+        image: A 4-D tensor of shape
+            `[batch, in_height, in_width, in_channels]`.
+        kernels: A 4-D tensor of shape
+            `[batch, kernel_size[0], kernel_size[1], num_transformed_images]` or
+
+    Returns:
+        A list of `num_transformed_images` 4-D tensors, each of shape
+            `[batch, in_height, in_width, in_channels]`.
+    """
+    if isinstance(image, list):
+        image_list = image
+        kernels_list = torch.chunk(kernels, len(image_list), dim=-1)
+        outputs = []
+        for image, kernels in zip(image_list, kernels_list):
+            outputs.extend(apply_kernels(image, kernels))
+    else:
+        outputs = apply_cdna_kernels(image, kernels, dilation_rate=dilation_rate)
+    return outputs
+
+### 待测试。。。5/30
+def apply_cdna_kernels(images, kernels, dilation_rate=(1, 1)):
+    """
+    Args:
+        image: A 4-D tensor of shape
+            `[batch, in_height, in_width, in_channels]`.
+        kernels: A 4-D of shape
+            `[batch, kernel_size[0], kernel_size[1], num_transformed_images]`.
+
+    Returns:
+        A list of `num_transformed_images` 4-D tensors, each of shape
+            `[batch, in_height, in_width, in_channels]`.
+    """
+    batch_size, height, width, color_channels = images.shape
+    batch_size, kernel_height, kernel_width, num_transformed_images = kernels.shape
+    images = images.permute([3, 0, 1, 2])
+    kernels = kernels.permute([3, 0, 1, 2])
+    images = torch.chunk(images, batch_size, dim=1)
+    kernels = torch.chunk(kernels, batch_size, dim=1)
+    outputs = []
+    for img, k in zip(images, kernels):
+        ### 将 color_channel 看作 batch_size，因为对不同的通道，transform是相同的 5/30
+        ### 对每个 sample 应用不同的 kernel 5/30
+        ### img = C1HW
+        ### K = C'1hw
+        ### output = CC'HW
+        output = F.conv2d(input=img, weight=k, padding=2) ### kernel 为 5*5 5/30
+        outputs.append(output)
+    ### outputs = NCC'HW 5/30
+    outputs = torch.cat(outputs, dim=0)
+    outputs = outputs.reshape([batch_size, color_channels, num_transformed_images, height, width])
+    outputs = outputs.permute([2, 0, 1, 3, 4])  ### C'NCHW 5/30
+    outputs = torch.split(outputs, 1, dim=0)
+    return outputs
+    
+
+    
 
 ### 融合BaseVideoPredModel 和 VideoPredModel 5/15
 class BaseVideoPredictionModel(nn.Module):
