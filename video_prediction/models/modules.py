@@ -279,10 +279,10 @@ class Posterior(nn.Module):
             h = self.dense0(h)
             h = self.rnn(h)
         z_mu = self.dense1(h).reshape([self.input_shape[0]-1]+[self.input_shape[1]]+[-1])
-        outputs['z_mu'] = z_mu
+        outputs['zs_mu'] = z_mu
         z_log_sigma_sq = self.dense2(h).reshape([self.input_shape[0]-1]+[self.input_shape[1]]+[-1])
         z_log_sigma_sq = torch.clamp(z_log_sigma_sq, -10,10)
-        outputs['z_log_sigma_sq'] = z_log_sigma_sq
+        outputs['zs_log_sigma_sq'] = z_log_sigma_sq
         return outputs
     
     
@@ -353,13 +353,13 @@ class Prior(nn.Module):
         
         h = h.reshape([-1, h.size(-1)])
         z_mu = self.dense1(h).reshape(self.concat_shape[0:2]+[-1])
-        outputs['z_mu'] = z_mu
+        outputs['zs_mu'] = z_mu
         z_log_sigma_sq = self.dense2(h).reshape(self.concat_shape[0:2]+[-1])
         z_log_sigma_sq = torch.clamp(z_log_sigma_sq, -10,10)
-        outputs['z_log_sigma_sq'] = z_log_sigma_sq
+        outputs['zs_log_sigma_sq'] = z_log_sigma_sq
         return outputs
         
-
+'''
 ### 编写于 5/23
 ### 待测试。。。
 class GeneratorGivenZ(nn.Module):
@@ -476,7 +476,7 @@ class Generator(nn.Module):
             outputs['gen_images_samples'] = gen_images_samples
             outputs['gen_images_samples_avg'] = gen_images_samples_avg
         
-        return outputs
+        return outputs'''
 
             
         

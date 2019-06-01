@@ -16,6 +16,7 @@ from video_prediction.utils import util
 from video_prediction.utils.max_sv import spectral_normed_weight
 from video_prediction.layers.conv import Conv2d, Conv3d
 from video_prediction.layers.convLSTM import ConvLSTMCell
+from video_prediction.models.modules import Prior, Posterior, Dense, Encoder
 
 
 class SAVPCell(nn.Module):
@@ -26,15 +27,17 @@ class SAVPCell(nn.Module):
         self.mode = mode
         self.hparams = hparams
         self.input_shape = input_shape  ### 设定为一个dict 5/23
-        self.batch_size = input_shape['images'].shape[0]   ### images.shape=NCHW 5/23
-        self.image_shape = list(input_shape['images'].shape[-3:])
+        self.batch_size = input_shape['images'][0]   ### images.shape=NCHW 5/23
+        self.image_shape = list(input_shape['images'][-3:])
         color_channel, height, width = self.image_shape
         self.num_encoder_layers = 4
-        self.time = 0
+        #self.time = 0
+        self.conv_rnn_state_sizes = []  ### 为初始化 state 做准备 6/1
         
         ############### latent code ###############
         ### LSTMCell inputs 应当是 (batch_size,input_size) 5/28
-        self.lstm_z = nn.LSTMCell(input_size=self.input_shape['zs'].shape[1], hidden_size=self.hparams.nz)
+        self.lstm_z = nn.LSTMCell(input_size=self.input_shape['zs'][1], hidden_size=self.hparams.nz)
+        self.rnn_z_state_sizes = [self.batch_size, self.hparams.nz]
         
         self.scale_size = min(height, width)
         if self.scale_size >= 256:
@@ -46,33 +49,37 @@ class SAVPCell(nn.Module):
             ### 第 0 层 5/26
             ### conv_pool + norm + activation 5/26
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
-            in_channel = self.input_shape['imaegs'][1]*2 + self.hparams.nz
+            in_channel = self.input_shape['images'][1]*2 + self.hparams.nz
             out_channel = self.hparams.ngf
+            ### 记录 conv rnn states 的 shape，便于初始化 6/1
+            ### 注意初始化时要有两个相同shape的state，分别是 h 和 c 6/1
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.encoder_0_conv = nn.ModuleList()
-            self.encoder_0_conv += nn.Conv2d(
+            self.encoder_0_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=5,
                                 stride=1,
-                                padding=(2,2))
-            self.encoder_0_conv += nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))
-            self.encoder_0_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.encoder_0_conv += nn.ReLU()
+                                padding=(2,2))]
+            self.encoder_0_conv += [nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))]
+            self.encoder_0_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.encoder_0_conv += [nn.ReLU()]
             ### 第 1 层 5/26
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*2
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.encoder_1_conv = nn.ModuleList()
-            self.encoder_1_conv += nn.Conv2d(
+            self.encoder_1_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.encoder_1_conv += nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))
-            self.encoder_1_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.encoder_1_conv += nn.ReLU()
-            self.encoder_1_rnn += ConvLSTMCell(
+                                padding=(1,1))]
+            self.encoder_1_conv += [nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))]
+            self.encoder_1_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.encoder_1_conv += [nn.ReLU()]
+            self.encoder_1_rnn = ConvLSTMCell(
                                 input_size=(conv_rnn_height,conv_rnn_width),
                                 input_dim=out_channel + self.hparams.nz,
                                 hidden_dim=out_channel)
@@ -80,17 +87,18 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*4
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.encoder_2_conv = nn.ModuleList()
-            self.encoder_2_conv += nn.Conv2d(
+            self.encoder_2_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.encoder_2_conv += nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))
-            self.encoder_2_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.encoder_2_conv += nn.ReLU()
-            self.encoder_2_rnn += ConvLSTMCell(
+                                padding=(1,1))]
+            self.encoder_2_conv += [nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))]
+            self.encoder_2_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.encoder_2_conv += [nn.ReLU()]
+            self.encoder_2_rnn = ConvLSTMCell(
                                 input_size=(conv_rnn_height,conv_rnn_width),
                                 input_dim=out_channel + self.hparams.nz,
                                 hidden_dim=out_channel)
@@ -98,17 +106,18 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*8
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.encoder_3_conv = nn.ModuleList()
-            self.encoder_3_conv += nn.Conv2d(
+            self.encoder_3_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.encoder_3_conv += nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))
-            self.encoder_3_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.encoder_3_conv += nn.ReLU()
-            self.encoder_3_rnn += ConvLSTMCell(
+                                padding=(1,1))]
+            self.encoder_3_conv += [nn.AvgPool2d(kernel_size=(2,2), stride=(2,2))]
+            self.encoder_3_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.encoder_3_conv += [nn.ReLU()]
+            self.encoder_3_rnn = ConvLSTMCell(
                                 input_size=(conv_rnn_height,conv_rnn_width),
                                 input_dim=out_channel + self.hparams.nz,
                                 hidden_dim=out_channel)
@@ -122,17 +131,18 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*8
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.decoder_4_conv = nn.ModuleList()
-            self.decoder_4_conv += nn.Upsample(scale_factor=2, mode='bilinear')
-            self.decoder_4_conv += nn.Conv2d(
+            self.decoder_4_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
+            self.decoder_4_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.decoder_4_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.decoder_4_conv += nn.ReLU()
-            self.decoder_4_rnn += ConvLSTMCell(
+                                padding=(1,1))]
+            self.decoder_4_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.decoder_4_conv += [nn.ReLU()]
+            self.decoder_4_rnn = ConvLSTMCell(
                                 input_size=(conv_rnn_height,conv_rnn_width),
                                 input_dim=out_channel + self.hparams.nz,
                                 hidden_dim=out_channel)
@@ -140,17 +150,18 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.ngf*4 + hparams.nz  ### 与第 2 层级联 5/29
             out_channel = self.hparams.ngf*4
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.decoder_5_conv = nn.ModuleList()
-            self.decoder_5_conv += nn.Upsample(scale_factor=2, mode='bilinear')
-            self.decoder_5_conv += nn.Conv2d(
+            self.decoder_5_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
+            self.decoder_5_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.decoder_5_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.decoder_5_conv += nn.ReLU()
-            self.decoder_5_rnn += ConvLSTMCell(
+                                padding=(1,1))]
+            self.decoder_5_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.decoder_5_conv += [nn.ReLU()]
+            self.decoder_5_rnn = ConvLSTMCell(
                                 input_size=(conv_rnn_height,conv_rnn_width),
                                 input_dim=out_channel + self.hparams.nz,
                                 hidden_dim=out_channel)
@@ -158,30 +169,32 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.ngf*2 + hparams.nz  ### 与第 1 层级联 5/29
             out_channel = self.hparams.ngf*2
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.decoder_6_conv = nn.ModuleList()
-            self.decoder_6_conv += nn.Upsample(scale_factor=2, mode='bilinear')
-            self.decoder_6_conv += nn.Conv2d(
+            self.decoder_6_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
+            self.decoder_6_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.decoder_6_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.decoder_6_conv += nn.ReLU()
+                                padding=(1,1))]
+            self.decoder_6_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.decoder_6_conv += [nn.ReLU()]
             ### 第 3 层 5/27
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.ngf + hparams.nz  ### 与第 0 层级联 5/29
             out_channel = self.hparams.ngf
+            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.decoder_7_conv = nn.ModuleList()
-            self.decoder_7_conv += nn.Upsample(scale_factor=2, mode='bilinear')
-            self.decoder_7_conv += nn.Conv2d(
+            self.decoder_7_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
+            self.decoder_7_conv += [nn.Conv2d(
                                 in_channels=in_channel,
                                 out_channels=out_channel,
                                 kernel_size=3,
                                 stride=1,
-                                padding=(1,1))
-            self.decoder_7_conv += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-            self.decoder_7_conv += nn.ReLU()
+                                padding=(1,1))]
+            self.decoder_7_conv += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+            self.decoder_7_conv += [nn.ReLU()]
             
         else:
             raise NotImplementedError
@@ -191,31 +204,31 @@ class SAVPCell(nn.Module):
         self.cdna_kernel_shape = list(self.hparams.kernel_size) + \
                     [self.hparams.last_frames * self.hparams.num_transformed_images]
         self.cdna = Dense(input_shape=[self.batch_size, self.cdna_dense_in_channel],
-                          units=torch.prod(self.cdna_kernel_shape))  ### Dense 的 input_shape 要改？ 5/29
+                          units=torch.prod(torch.tensor(self.cdna_kernel_shape)))### Dense 的 input_shape 要改？ 5/29
         
         ############### scratch_images ###############
         in_channel = out_channel   ### 来自 decoder 最后一层的输出 h 5/30
         out_channel = self.hparams.ngf
         self.scratch_h = nn.ModuleList()
-        self.scratch_h += nn.Conv2d(
+        self.scratch_h += [nn.Conv2d(
                         in_channels=in_channel,
                         out_channels=out_channel,
                         kernel_size=3,
                         stride=1,
-                        padding=(1,1))
-        self.scratch_h += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-        self.scratch_h += nn.ReLU()
+                        padding=(1,1))]
+        self.scratch_h += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+        self.scratch_h += [nn.ReLU()]
         
         in_channel = out_channel
         out_channel = color_channel
         self.scratch_img = nn.ModuleList()
-        self.scratch_img += nn.Conv2d(
+        self.scratch_img += [nn.Conv2d(
                         in_channels=in_channel,
                         out_channels=out_channel,
                         kernel_size=3,
                         stride=1,
-                        padding=(1,1))
-        self.scratch_img += nn.Sigmoid()
+                        padding=(1,1))]
+        self.scratch_img += [nn.Sigmoid()]
         
         ############### masks ###############
         self.num_masks = self.hparams.last_frames * self.hparams.num_transformed_images + \
@@ -229,43 +242,45 @@ class SAVPCell(nn.Module):
         in_channel = self.hparams.ngf    ### 来自 decoder 最后一层的输出 h 5/30
         out_channel = self.hparams.ngf
         self.masks_h = nn.ModuleList()
-        self.masks_h += nn.Conv2d(
+        self.masks_h += [nn.Conv2d(
                         in_channels=in_channel,
                         out_channels=out_channel,
                         kernel_size=3,
                         stride=1,
-                        padding=(1,1))
-        self.masks_h += nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)
-        self.masks_h += nn.ReLU()
+                        padding=(1,1))]
+        self.masks_h += [nn.InstanceNorm2d(num_features=out_channel, eps=1e-6)]
+        self.masks_h += [nn.ReLU()]
         
         ### 认为 num_masks=num_transformed_images
-        in_channel = out_channel + num_maskes * color_channel ### tf.concat([h_masks] + transformed_images, axis=-1) 5/30
+        in_channel = out_channel + self.num_masks * color_channel ### tf.concat([h_masks] + transformed_images, axis=-1) 5/30
         out_channel = self.num_masks
         self.masks = nn.ModuleList()
-        self.masks += nn.Conv2d(
+        self.masks += [nn.Conv2d(
                         in_channels=in_channel,
                         out_channels=out_channel,
                         kernel_size=3,
                         stride=1,
-                        padding=(1,1))
-        self.masks += nn.Softmax()
+                        padding=(1,1))]
+        self.masks += [nn.Softmax()]
         
         
         
         
-    def forward(inputs, states, all_images):
+    def forward(self, inputs, states, all_images):
         ### inputs = {'images':(NCHW), 'zs':(N,nz),} 5/28
         ### states = {'gen_image':(NCHW), 'last_images':(DNCHW), 'rnn_z_state':(hx,cx), 'conv_rnn_states':, } 5/28
         ### all_images = (DNCHW) 代替原来的 self.inputs['images'] 5/29
-        t = self.time
+        time = states['time']
         conv_rnn_states = states['conv_rnn_states']
         ### 暂时忽略schedule sampling 5/28
-        image = inputs['images'] if t<self.hparams.context_frames else states['gen_image']
+        image = inputs['images'] if time<self.hparams.context_frames else states['gen_image']
         last_images = states['last_images'][1:]+[image]  ### 待测试 5/28
         
         ############### latent code ###############
         state_action_z = []
         ### states['rnn_z_state'] 应该是一个 tuple=(hx,cx) 5/28
+        #print(inputs['zs'].shape)
+        #print(states['rnn_z_state'][0].shape)
         hx, cx = self.lstm_z(inputs['zs'], states['rnn_z_state'])
         rnn_z_state = (hx, cx)  ### hx,cx 对应 rnn_z, rnn_z_state 5/29
         state_action_z = hx    ### state_action_z = (N, hidden_size=hparams.nz) 5/29
@@ -276,7 +291,7 @@ class SAVPCell(nn.Module):
         ### 第 0 层 5/29
         ### all_images 代替原来的 self.inputs['images'][0] 5/29
         h = torch.cat([image, all_images[0]], dim=1)  ### h = (N,C*2,H,W) 5/29
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)  ### h = (N, C*2+hparams.nz, H,W) 5/29
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)  ### h = (N, C*2+hparams.nz, H,W) 5/29
         for layer in self.encoder_0_conv:
             h = layer(h)
         layers.append((h,))   ### h=(N, hparams.hgf, H/2, W/2) 5/29
@@ -404,6 +419,162 @@ class SAVPCell(nn.Module):
         
         return outputs, new_states
         
+
+### 编写于 5/23 6/1
+class GeneratorGivenZ(nn.Module):
+    ### inputs 是一个 dict 5/23
+    ### keys() = ['images', 'zs'] 5/23
+    def __init__(self, input_shape, mode, hparams):
+        super(GeneratorGivenZ, self).__init__()
+        self.input_shape = input_shape
+        self.image_shape = list(input_shape['images'][2:])
+        self.time_length = input_shape['images'][0]
+        self.hparams = hparams
+        self.mode = mode
+        
+        savp_input_shape = {}
+        savp_input_shape['images'] = list(input_shape['images'][1:])
+        savp_input_shape['zs'] = list(input_shape['zs'][1:])
+        print(savp_input_shape)
+        self.savpcell = SAVPCell(savp_input_shape, mode, hparams)
+        
+        
+    def forward(self, inputs):
+        inputs = {name: maybe_pad_or_slice(input, self.hparams.sequence_length - 1)
+              for name, input in inputs.items()}
+        ### initial state 6/1
+        states = {}
+        states['time'] = 0
+        states['gen_image'] = torch.zeros(self.image_shape)
+        states['last_images'] = [inputs['images'][0]] * self.hparams.last_frames
+        rnn_z_state_sizes = self.savpcell.rnn_z_state_sizes
+        conv_rnn_state_sizes = self.savpcell.conv_rnn_state_sizes
+        states['rnn_z_state'] = (torch.zeros(rnn_z_state_sizes),torch.zeros(rnn_z_state_sizes))
+        states['conv_rnn_states'] = [(torch.zeros(conv_rnn_state_size),torch.zeros(conv_rnn_state_size))
+                                    for conv_rnn_state_size in conv_rnn_state_sizes]
+        
+        ### 把 savpcell 扩展成 rnn 6/1
+        outputs = {}
+        for i in range(self.time_length):
+            input = {k: v[i] for k, v in inputs.items()}
+            output, new_states = self.savpcell(input, states, inputs['images'])
+            if i==0:
+                outputs = output
+            else:
+                for k in output.keys():
+                    outputs[k] = torch.cat([outputs[k],[output[k]]],dim=0)
+            states = new_states
+            
+        return outputs
+
+
+### 编写于 5/23
+### 待测试。。。 5/23
+class Generator(nn.Module):
+    ### inputs DNCHW 5/23
+    def __init__(self, input_shape, mode, hparams):
+        super(Generator, self).__init__()
+        self.mode = mode
+        self.hparams = hparams
+        self.input_shape = input_shape
+        self.batch_size = input_shape[1]
+        
+        self.zs_shape = [hparams.sequence_length - 1, self.batch_size, hparams.nz]
+        self.encoder = Posterior(input_shape, hparams)
+        if hparams.learn_prior:
+            self.prior = Prior(input_shape, hparams)
+        else:
+            self.prior = None
+        posterior_shape = {}
+        posterior_shape['images'] = input_shape
+        posterior_shape['zs'] = [input_shape[0]-1, input_shape[1], hparams.nz]
+        self.generator = GeneratorGivenZ(input_shape=posterior_shape, mode=mode, hparams=hparams)  ### 待完成 5/23
+        
+    def forward(self, images):
+        inputs = {}
+        inputs['images'] = images
+        if self.hparams.nz == 0:
+            outputs = self.generator(inputs)
+        else:
+            ### encoder 生成 posterior  5/23
+            outputs_posterior = self.encoder(inputs['images'])
+            #print(outputs_posterior)
+            eps = torch.randn(self.zs_shape)
+            zs_posterior = outputs_posterior['zs_mu'] + \
+                    torch.sqrt(torch.exp(outputs_posterior['zs_log_sigma_sq'])) * eps
+            inputs_posterior = inputs
+            inputs_posterior['zs'] = zs_posterior
+            for k, v in inputs_posterior.items():
+                print(k, v.shape)
+            print('-'*20)
+            
+            ### 生成 prior 5/23
+            if self.hparams.learn_prior:
+                outputs_prior = self.prior(inputs['images'])
+                eps = torch.randn(self.zs_shape)
+                zs_prior = outputs_prior['zs_mu'] + \
+                    torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq'])) * eps
+            else:
+                outputs_prior = {}
+                zs_prior = torch.randn([self.hparams.sequence_length - self.hparams.context_frames] + \
+                                       self.zs_shape[1:])
+                zs_prior = torch.cat([zs_posterior[:self.hparams.context_frames - 1], zs_prior], dim=0)
+            inputs_prior = inputs
+            inputs_prior['zs'] = zs_prior
+            for k, v in inputs_prior.items():
+                print(k, v.shape)
+            print('-'*20)
+            
+            ### posterior 和 images 交给 generator 5/23
+            gen_outputs_posterior = self.generator(inputs_posterior)
+            gen_outputs = self.generator(inputs_prior)
+            
+            # rename tensors to avoid name collisions
+            output_prior = collections.OrderedDict([(k + '_prior', v) for k, v in outputs_prior.items()])
+            outputs_posterior = collections.OrderedDict([(k + '_enc', v) for k, v in outputs_posterior.items()])
+            gen_outputs_posterior = collections.OrderedDict([(k + '_enc', v) for k, v in gen_outputs_posterior.items()])
+            
+            outputs = [output_prior, gen_outputs, outputs_posterior, gen_outputs_posterior]
+            total_num_outputs = sum([len(output) for output in outputs])
+            ### 整合 5/23
+            outputs = collections.OrderedDict(itertools.chain(*[output.items() for output in outputs]))
+            assert len(outputs) == total_num_outputs  # ensure no output is lost because of repeated keys
+
+            ### 根据 prior 生成多个随机抽样 5/23
+            ### num_samples 是采样的个数 5/23
+            inputs_samples = {
+                name: torch.repeat(input[:, None], [1, self.hparams.num_samples]+[1]*(input.shape.ndims - 1))
+                for name, input in inputs.items()}
+            zs_samples_shape = [self.hparams.sequence_length - 1,
+                                self.hparams.num_samples,
+                                self.batch_size,
+                                self.hparams.nz]
+            if self.hparam.learn_prior:
+                eps = torch.randn(zs_samples_shape)
+                zs_prior_samples = (outputs_prior['zs_mu'][:, None] +
+                                torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq']))[:, None] * eps)
+            else:
+                zs_prior_samples = torch.randn(
+                    [self.hparams.sequence_length - self.hparams.context_frames] + zs_samples_shape[1:])
+                zs_prior_samples = torch.cat(
+                    [torch.repeat(zs_posterior[:self.hparams.context_frames - 1][:, None],
+                                  [1, self.hparams.num_samples, 1, 1]),
+                     zs_prior_samples], dim=0)
+            inputs_prior_samples = dict(inputs_samples)
+            inputs_prior_samples['zs'] = zs_prior_samples
+            
+            ### 第1，2个维度压平 5/23
+            inputs_prior_samples = {name: torch.flatten(input, start_dim=1, end_dim=2)
+                                    for name, input in inputs_prior_samples.items()}
+            gen_outputs_samples = self.generator(inputs_prior_samples)
+            gen_images_samples = gen_outputs_samples['gen_images']
+            ### 再恢复出前两个维度 5/23
+            gen_images_samples = torch.stack(gen_images_samples.chunk(self.hparams.num_samples, dim=1), dim=-1)
+            gen_images_samples_avg = torch.mean(gen_images_samples, dim=-1)
+            outputs['gen_images_samples'] = gen_images_samples
+            outputs['gen_images_samples_avg'] = gen_images_samples_avg
+        
+        return outputs
         
         
 ### 5/30
@@ -490,8 +661,6 @@ class BaseVideoPredictionModel(nn.Module):
                  num_gpus=None, eval_num_samples=100,
                  eval_num_samples_for_diversity=10, eval_parallel_iterations=1,
                  aggregate_nccl=False,
-                 hparams_dict=None,
-                 hparams=None,
                  **kwargs):
         """
         Base video prediction model.
