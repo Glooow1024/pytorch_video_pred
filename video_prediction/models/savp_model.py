@@ -5,6 +5,7 @@ import functools
 import itertools
 import os
 import re
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,7 +28,7 @@ class SAVPCell(nn.Module):
         self.mode = mode
         self.hparams = hparams
         self.input_shape = input_shape  ### 设定为一个dict 5/23
-        self.batch_size = input_shape['images'][0]   ### images.shape=NCHW 5/23
+        #self.batch_size = input_shape['images'][0]   ### images.shape=NCHW 5/23 修改为不受batch_size约束 6/3
         self.image_shape = list(input_shape['images'][-3:])
         color_channel, height, width = self.image_shape
         self.num_encoder_layers = 4
@@ -37,7 +38,7 @@ class SAVPCell(nn.Module):
         ############### latent code ###############
         ### LSTMCell inputs 应当是 (batch_size,input_size) 5/28
         self.lstm_z = nn.LSTMCell(input_size=self.input_shape['zs'][1], hidden_size=self.hparams.nz)
-        self.rnn_z_state_sizes = [self.batch_size, self.hparams.nz]
+        self.rnn_z_state_sizes = [self.hparams.nz]  ### [self.batch_size, self.hparams.nz] 6/3
         
         self.scale_size = min(height, width)
         if self.scale_size >= 256:
@@ -53,7 +54,7 @@ class SAVPCell(nn.Module):
             out_channel = self.hparams.ngf
             ### 记录 conv rnn states 的 shape，便于初始化 6/1
             ### 注意初始化时要有两个相同shape的state，分别是 h 和 c 6/1
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            #self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
             self.encoder_0_conv = nn.ModuleList()
             self.encoder_0_conv += [nn.Conv2d(
                                 in_channels=in_channel,
@@ -68,7 +69,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*2
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width]) ### 去掉self.batch_size,6/3 
             self.encoder_1_conv = nn.ModuleList()
             self.encoder_1_conv += [nn.Conv2d(
                                 in_channels=in_channel,
@@ -87,7 +88,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*4
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width])### 去掉self.batch_size,6/3
             self.encoder_2_conv = nn.ModuleList()
             self.encoder_2_conv += [nn.Conv2d(
                                 in_channels=in_channel,
@@ -106,7 +107,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*8
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width])### 去掉self.batch_size,6/3
             self.encoder_3_conv = nn.ModuleList()
             self.encoder_3_conv += [nn.Conv2d(
                                 in_channels=in_channel,
@@ -131,7 +132,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.nz
             out_channel = self.hparams.ngf*8
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width])### 去掉self.batch_size,6/3
             self.decoder_4_conv = nn.ModuleList()
             self.decoder_4_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
             self.decoder_4_conv += [nn.Conv2d(
@@ -150,7 +151,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.ngf*4 + hparams.nz  ### 与第 2 层级联 5/29
             out_channel = self.hparams.ngf*4
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width])### 去掉self.batch_size,6/3
             self.decoder_5_conv = nn.ModuleList()
             self.decoder_5_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
             self.decoder_5_conv += [nn.Conv2d(
@@ -169,7 +170,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.ngf*2 + hparams.nz  ### 与第 1 层级联 5/29
             out_channel = self.hparams.ngf*2
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            #self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width])### 去掉self.batch_size,6/3
             self.decoder_6_conv = nn.ModuleList()
             self.decoder_6_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
             self.decoder_6_conv += [nn.Conv2d(
@@ -184,7 +185,7 @@ class SAVPCell(nn.Module):
             conv_rnn_height, conv_rnn_width = conv_rnn_height*2, conv_rnn_width*2
             in_channel = out_channel + hparams.ngf + hparams.nz  ### 与第 0 层级联 5/29
             out_channel = self.hparams.ngf
-            self.conv_rnn_state_sizes.append([self.batch_size, out_channel, conv_rnn_height, conv_rnn_width])
+            #self.conv_rnn_state_sizes.append([out_channel, conv_rnn_height, conv_rnn_width])### 去掉self.batch_size,6/3
             self.decoder_7_conv = nn.ModuleList()
             self.decoder_7_conv += [nn.Upsample(scale_factor=2, mode='bilinear')]
             self.decoder_7_conv += [nn.Conv2d(
@@ -203,8 +204,8 @@ class SAVPCell(nn.Module):
         ### for cdna kernel, 忽略其他transformation 5/27
         self.cdna_kernel_shape = list(self.hparams.kernel_size) + \
                     [self.hparams.last_frames * self.hparams.num_transformed_images]
-        self.cdna = Dense(input_shape=[self.batch_size, self.cdna_dense_in_channel],
-                          units=torch.prod(torch.tensor(self.cdna_kernel_shape)))### Dense 的 input_shape 要改？ 5/29
+        self.cdna = Dense(in_channels=self.cdna_dense_in_channel,
+                          out_channels=torch.prod(torch.tensor(self.cdna_kernel_shape)))
         
         ############### scratch_images ###############
         in_channel = out_channel   ### 来自 decoder 最后一层的输出 h 5/30
@@ -264,9 +265,8 @@ class SAVPCell(nn.Module):
         self.masks += [nn.Softmax()]
         
         
-        
-        
     def forward(self, inputs, states, all_images):
+        #print('SAVPCell conv_rnn_state_sizes', self.conv_rnn_state_sizes[0])   ### 6/3
         ### inputs = {'images':(NCHW), 'zs':(N,nz),} 5/28
         ### states = {'gen_image':(NCHW), 'last_images':(DNCHW), 'rnn_z_state':(hx,cx), 'conv_rnn_states':, } 5/28
         ### all_images = (DNCHW) 代替原来的 self.inputs['images'] 5/29
@@ -281,6 +281,9 @@ class SAVPCell(nn.Module):
         ### states['rnn_z_state'] 应该是一个 tuple=(hx,cx) 5/28
         #print(inputs['zs'].shape)
         #print(states['rnn_z_state'][0].shape)
+        #print('savpcell latent_code : inputs[zs]  ', inputs['zs'].shape)
+        #print('savpcell latent_code : states[rnn_z_state]  ', len(states['rnn_z_state']),states['rnn_z_state'][0].shape)
+        #print('-'*20)
         hx, cx = self.lstm_z(inputs['zs'], states['rnn_z_state'])
         rnn_z_state = (hx, cx)  ### hx,cx 对应 rnn_z, rnn_z_state 5/29
         state_action_z = hx    ### state_action_z = (N, hidden_size=hparams.nz) 5/29
@@ -295,67 +298,89 @@ class SAVPCell(nn.Module):
         for layer in self.encoder_0_conv:
             h = layer(h)
         layers.append((h,))   ### h=(N, hparams.hgf, H/2, W/2) 5/29
+        #print('encoder_0: h   ',h.shape)   ### for debug 6/2
+        #print('-'*20)
         ### 第 1 层 5/29
         h = layers[-1][-1]
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)### h=(N, hparams.rgf+hparams.nz, H/2,W/2) 5/29
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)### h=(N,hparams.rgf+hparams.nz,H/2,W/2) 5/29
+        #print('encoder_1_conv input: state_action_z  ', state_action_z[:,:,None,None].shape)
+        #print('encoder_1_conv input: h_cat  ', h.shape) ### 6/2
         for layer in self.encoder_1_conv:
             h = layer(h)
+        #print('encoder_1_conv output: h  ', h.shape)  ### 6/2
         conv_rnn_h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         conv_rnn_state = conv_rnn_states[len(new_conv_rnn_states)]
-        conv_rnn_h, conv_rnn_state = self.encoder_1_rnn(conv_rnn_h, conv_rnn_state)  ### 为什么是这样？ 5/29
+        #print('encoder_1_rnn input: conv_rnn_h  ', conv_rnn_h.shape)  ### 6/2
+        #print('encoder_1_rnn state: conv_rnn_state  ', conv_rnn_state[0].shape, conv_rnn_state[1].shape)  ### 6/2
+        ### conv_rnn_h, conv_rnn_state 换为 hx,cx 6/2
+        hx, cx = self.encoder_1_rnn(conv_rnn_h, conv_rnn_state)  ### 为什么是这样？ 5/29
+        conv_rnn_state = (hx, cx)
+        conv_rnn_h = hx
         new_conv_rnn_states.append(conv_rnn_state)
         layers.append((h, conv_rnn_h))
+        #print('-'*20)   ### 6/2
         ### 第 2 层 5/29
         h = layers[-1][-1]
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)  ### h=(N,out_channel+hparams.nz,h',w') 5/29
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)  ### h=(N,out_channel+hparams.nz,h',w') 5/29
         for layer in self.encoder_2_conv:
             h = layer(h)
         conv_rnn_h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         conv_rnn_state = conv_rnn_states[len(new_conv_rnn_states)]
-        conv_rnn_h, conv_rnn_state = self.encoder_2_rnn(conv_rnn_h, conv_rnn_state)
+        ### conv_rnn_h, conv_rnn_state 换为 hx,cx 6/2
+        hx, cx = self.encoder_2_rnn(conv_rnn_h, conv_rnn_state)  ### 为什么是这样？ 5/29
+        conv_rnn_state = (hx, cx)
+        conv_rnn_h = hx
         new_conv_rnn_states.append(conv_rnn_state)
         layers.append((h, conv_rnn_h))
         ### 第 3 层 5/29
         h = layers[-1][-1]
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         for layer in self.encoder_3_conv:
             h = layer(h)
         conv_rnn_h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         conv_rnn_state = conv_rnn_states[len(new_conv_rnn_states)]
-        conv_rnn_h, conv_rnn_state = self.encoder_3_rnn(conv_rnn_h, conv_rnn_state)
+        ### conv_rnn_h, conv_rnn_state 换为 hx,cx 6/2
+        hx, cx = self.encoder_3_rnn(conv_rnn_h, conv_rnn_state)
+        conv_rnn_h = hx
         new_conv_rnn_states.append(conv_rnn_state)
         layers.append((h, conv_rnn_h))
         
         ############### decoder ###############
         ### 第 4 层 5/29
         h = layers[-1][-1]
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         for layer in self.decoder_4_conv:
             h = layer(h)
         conv_rnn_h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         conv_rnn_state = conv_rnn_states[len(new_conv_rnn_states)]
-        conv_rnn_h, conv_rnn_state = self.decoder_4_rnn(conv_rnn_h, conv_rnn_state)
+        ### conv_rnn_h, conv_rnn_state 换为 hx,cx 6/2
+        hx, cx = self.decoder_4_rnn(conv_rnn_h, conv_rnn_state)
+        conv_rnn_state = (hx, cx)
+        conv_rnn_h = hx
         new_conv_rnn_states.append(conv_rnn_state)
         layers.append((h, conv_rnn_h))
         ### 第 5 层 5/29
         h = torch.cat([layers[-1][-1], layers[2][-1]], dim=1)
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         for layer in self.decoder_5_conv:
             h = layer(h)
         conv_rnn_h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         conv_rnn_state = conv_rnn_states[len(new_conv_rnn_states)]
-        conv_rnn_h, conv_rnn_state = self.decoder_5_rnn(conv_rnn_h, conv_rnn_state)
+        ### conv_rnn_h, conv_rnn_state 换为 hx,cx 6/2
+        hx, cx = self.decoder_5_rnn(conv_rnn_h, conv_rnn_state)
+        conv_rnn_state = (hx, cx)
+        conv_rnn_h = hx
         new_conv_rnn_states.append(conv_rnn_state)
         layers.append((h, conv_rnn_h))
         ### 第 6 层 5/29
         h = torch.cat([layers[-1][-1], layers[1][-1]], dim=1)
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         for layer in self.decoder_6_conv:
             h = layer(h)
         layers.append((h,))
         ### 第 7 层 5/29
         h = torch.cat([layers[-1][-1], layers[0][-1]], dim=1)
-        h = util.tile_concat([h, state_action_z[:, :, None, None]], dim=1)
+        h = util.tile_concat([h, state_action_z[:, :, None, None]], axis=1)
         for layer in self.decoder_7_conv:
             h = layer(h)
         layers.append((h,))
@@ -364,7 +389,9 @@ class SAVPCell(nn.Module):
         ############### cdna kernel ###############
         smallest_layer = layers[self.num_encoder_layers - 1][-1]
         cdna_kernels = self.cdna(torch.flatten(smallest_layer, start_dim=1, end_dim=-1))
-        cdna_kernels = cdna_kernels.reshape([self.batch_size] + self.cdna_kernel_shape)
+        cdna_kernels = cdna_kernels.reshape([-1] + self.cdna_kernel_shape)### self.batch_size改为-1 6/3
+        #print(cdna_kernels.dtype)   ### torch.float32 6//2
+        #print(identity_kernel(self.hparams.kernel_size)[None, :, :, None].dtype)  ### 6/2
         cdna_kernels = cdna_kernels + identity_kernel(self.hparams.kernel_size)[None, :, :, None]
         ### cdna_kernels.shape=(batch_size, 5, 5, last_frames * num_transformed_images) 5/30
         
@@ -375,10 +402,11 @@ class SAVPCell(nn.Module):
         
         scratch_image = h_scratch
         for layer in self.scratch_img:
-            scratch_image = layer(scratch)
+            scratch_image = layer(scratch_image)
         
         ############# transformed images #############
         transformed_images = []
+        #print('transformed_images input: last_images  ', len(last_images),last_images[0].shape)  ### 6/2
         transformed_images.extend(apply_kernels(last_images, cdna_kernels, self.hparams.dilation_rate))
         if self.hparams.prev_image_background:
             transformed_images.append(image)
@@ -390,21 +418,30 @@ class SAVPCell(nn.Module):
             transformed_images.extend(torch.split(all_images[:self.hparams.context_frames],1,dim=0))
         if self.hparams.generate_scratch_image:
             transformed_images.append(scratch_image)
+        #print('transformed_images')
+        #for i,img in enumerate(transformed_images):
+        #    print(i, img.shape)
+        #print('-'*20)  ### 6/2
         
         ################### mask ###################
         h_masks = layers[-1][-1]
         for layer in self.masks_h:
             h_masks = layer(h_masks)
         
+        #print('mask input: h_masks  ',h_masks.shape)   ### torch.Size([6, 32, 160, 320]) 6/2
+        #print('mask input: transformed_images  ',
+        #      len(transformed_images),transformed_images[0].shape) ### 7 torch.Size([1, 6, 320, 3, 160]) 6/2
         masks = torch.cat([h_masks] + transformed_images, dim=1)  ### channel 维度级联 5/30
         for layer in self.masks:
             masks = layer(masks)
         
-        masks = torch.split(masks, len(transformed_images), dim=1)
+        masks = torch.chunk(masks, len(transformed_images), dim=1)
+        #print('mask output: masks  ',len(masks),masks[0].shape)  ### 6/2
+        #print('-'*20)
         
         ############# generate images #############
         assert len(transformed_images) == len(masks)
-        gen_image = sum([trans_image * mask for tran_image, mask in zip(transformed_images, masks)])
+        gen_image = sum([trans_image * mask for trans_image, mask in zip(transformed_images, masks)])
         
         ################## output ##################
         outputs = {'gen_images': gen_image,
@@ -423,48 +460,78 @@ class SAVPCell(nn.Module):
 ### 编写于 5/23 6/1
 class GeneratorGivenZ(nn.Module):
     ### inputs 是一个 dict 5/23
-    ### keys() = ['images', 'zs'] 5/23
+    ### items() = ['images':NCHW, 'zs':(N,nz)] 5/23
     def __init__(self, input_shape, mode, hparams):
         super(GeneratorGivenZ, self).__init__()
         self.input_shape = input_shape
         self.image_shape = list(input_shape['images'][2:])
-        self.time_length = input_shape['images'][0]
+        self.time_length = hparams.sequence_length - 1
         self.hparams = hparams
         self.mode = mode
         
         savp_input_shape = {}
         savp_input_shape['images'] = list(input_shape['images'][1:])
         savp_input_shape['zs'] = list(input_shape['zs'][1:])
-        print(savp_input_shape)
+        #print('GeneratorGivenZ: savp_input_shape  ',savp_input_shape)
         self.savpcell = SAVPCell(savp_input_shape, mode, hparams)
         
         
     def forward(self, inputs):
         inputs = {name: maybe_pad_or_slice(input, self.hparams.sequence_length - 1)
               for name, input in inputs.items()}
+        batch_size = inputs['images'].shape[1]
+        #print('GeneratorGivenZ inputs[images]  ',inputs['images'].shape)
+        #print('GeneratorGivenZ batch_size',batch_size)
+        #print('-'*20)
+        #print('GeneratorGivenZ input : sequence_length  ',self.hparams.sequence_length)
+        #for k,v in inputs.items():
+        #    print(k,v.shape)
         ### initial state 6/1
         states = {}
         states['time'] = 0
         states['gen_image'] = torch.zeros(self.image_shape)
         states['last_images'] = [inputs['images'][0]] * self.hparams.last_frames
-        rnn_z_state_sizes = self.savpcell.rnn_z_state_sizes
-        conv_rnn_state_sizes = self.savpcell.conv_rnn_state_sizes
-        states['rnn_z_state'] = (torch.zeros(rnn_z_state_sizes),torch.zeros(rnn_z_state_sizes))
-        states['conv_rnn_states'] = [(torch.zeros(conv_rnn_state_size),torch.zeros(conv_rnn_state_size))
-                                    for conv_rnn_state_size in conv_rnn_state_sizes]
+        #print(self.savpcell.rnn_z_state_sizes)
+        rnn_z_state_size = [batch_size] + self.savpcell.rnn_z_state_sizes
+        #print(self.savpcell.rnn_z_state_sizes)
+        conv_rnn_state_size = copy.deepcopy(self.savpcell.conv_rnn_state_sizes)  ### deepcopy()!!!! 6/3
+        #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ', self.savpcell.conv_rnn_state_sizes[0])
+        #print('GeneratorGivenZ : con_rnn_state_sizes[0]  ', conv_rnn_state_size[0])
+        for i in range(len(conv_rnn_state_size)):
+            conv_rnn_state_size[i] = [batch_size] + conv_rnn_state_size[i]
+        #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes[0])
+        states['rnn_z_state'] = (torch.zeros(rnn_z_state_size),torch.zeros(rnn_z_state_size))
+        states['conv_rnn_states'] = [(torch.zeros(conv_rnn_state_sz),torch.zeros(conv_rnn_state_sz))
+                                    for conv_rnn_state_sz in conv_rnn_state_size]
         
+        #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes[0])
         ### 把 savpcell 扩展成 rnn 6/1
         outputs = {}
         for i in range(self.time_length):
             input = {k: v[i] for k, v in inputs.items()}
             output, new_states = self.savpcell(input, states, inputs['images'])
+            #print('GeneratorGivenZ rnn input:  ')   ### 6/2
+            #for k,v in input.items():
+            #    print(k, v.shape)
+            #print('GeneratorGivenZ rnn output:  ') ### 6/2
+            #for k,v in output.items():
+            #    print(k, v.shape)
             if i==0:
-                outputs = output
+                for k in output.keys():
+                    outputs[k] = [output[k]]
             else:
                 for k in output.keys():
-                    outputs[k] = torch.cat([outputs[k],[output[k]]],dim=0)
+                    outputs[k].append(output[k])
             states = new_states
             
+        for k,v in outputs.items():
+            outputs[k] = torch.stack(outputs[k], dim=0)
+            
+        print('GeneratorGivenZ outputs')
+        for k,v in outputs.items():
+            print(k, v.shape)
+        print('-'*20)
+        #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes)
         return outputs
 
 
@@ -504,6 +571,7 @@ class Generator(nn.Module):
                     torch.sqrt(torch.exp(outputs_posterior['zs_log_sigma_sq'])) * eps
             inputs_posterior = inputs
             inputs_posterior['zs'] = zs_posterior
+            print('Generator : inputs_posterior')
             for k, v in inputs_posterior.items():
                 print(k, v.shape)
             print('-'*20)
@@ -521,13 +589,16 @@ class Generator(nn.Module):
                 zs_prior = torch.cat([zs_posterior[:self.hparams.context_frames - 1], zs_prior], dim=0)
             inputs_prior = inputs
             inputs_prior['zs'] = zs_prior
+            print('Generator : inputs_prior')
             for k, v in inputs_prior.items():
                 print(k, v.shape)
             print('-'*20)
             
             ### posterior 和 images 交给 generator 5/23
             gen_outputs_posterior = self.generator(inputs_posterior)
+            print('-'*20,' gen posterior complete ','-'*20)
             gen_outputs = self.generator(inputs_prior)
+            print('-'*20,' gen prior complete ','-'*20)
             
             # rename tensors to avoid name collisions
             output_prior = collections.OrderedDict([(k + '_prior', v) for k, v in outputs_prior.items()])
@@ -543,13 +614,17 @@ class Generator(nn.Module):
             ### 根据 prior 生成多个随机抽样 5/23
             ### num_samples 是采样的个数 5/23
             inputs_samples = {
-                name: torch.repeat(input[:, None], [1, self.hparams.num_samples]+[1]*(input.shape.ndims - 1))
+                name: input[:, None].repeat([1, self.hparams.num_samples]+[1]*(len(input.shape) - 1))
                 for name, input in inputs.items()}
             zs_samples_shape = [self.hparams.sequence_length - 1,
                                 self.hparams.num_samples,
                                 self.batch_size,
                                 self.hparams.nz]
-            if self.hparam.learn_prior:
+            print('Generator : inputs_samples')
+            for k,v in inputs_samples.items():
+                print(k, v.shape)
+            print('-'*20)
+            if self.hparams.learn_prior:
                 eps = torch.randn(zs_samples_shape)
                 zs_prior_samples = (outputs_prior['zs_mu'][:, None] +
                                 torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq']))[:, None] * eps)
@@ -557,7 +632,7 @@ class Generator(nn.Module):
                 zs_prior_samples = torch.randn(
                     [self.hparams.sequence_length - self.hparams.context_frames] + zs_samples_shape[1:])
                 zs_prior_samples = torch.cat(
-                    [torch.repeat(zs_posterior[:self.hparams.context_frames - 1][:, None],
+                    [zs_posterior[:self.hparams.context_frames - 1][:, None].repeat(
                                   [1, self.hparams.num_samples, 1, 1]),
                      zs_prior_samples], dim=0)
             inputs_prior_samples = dict(inputs_samples)
@@ -569,6 +644,8 @@ class Generator(nn.Module):
             gen_outputs_samples = self.generator(inputs_prior_samples)
             gen_images_samples = gen_outputs_samples['gen_images']
             ### 再恢复出前两个维度 5/23
+            print('Generator samples')
+            print('Generator : gen_images_Samples  ',gen_images_samples.shape)
             gen_images_samples = torch.stack(gen_images_samples.chunk(self.hparams.num_samples, dim=1), dim=-1)
             gen_images_samples_avg = torch.mean(gen_images_samples, dim=-1)
             outputs['gen_images_samples'] = gen_images_samples
@@ -593,13 +670,13 @@ def identity_kernel(kernel_size):
 
     kernel[center_slice(kh), center_slice(kw)] = 1.0
     kernel /= np.sum(kernel)
-    return kernel
+    return torch.FloatTensor(kernel)
         
 def apply_kernels(image, kernels, dilation_rate=(1, 1)):
     """
     Args:
         image: A 4-D tensor of shape
-            `[batch, in_height, in_width, in_channels]`.
+            `[batch, in_channels, in_height, in_width]`.
         kernels: A 4-D tensor of shape
             `[batch, kernel_size[0], kernel_size[1], num_transformed_images]` or
 
@@ -615,6 +692,7 @@ def apply_kernels(image, kernels, dilation_rate=(1, 1)):
             outputs.extend(apply_kernels(image, kernels))
     else:
         outputs = apply_cdna_kernels(image, kernels, dilation_rate=dilation_rate)
+    #print('apply_kernels: output  ', len(outputs),outputs[0].shape)  ### 6/2
     return outputs
 
 ### 待测试。。。5/30
@@ -622,17 +700,19 @@ def apply_cdna_kernels(images, kernels, dilation_rate=(1, 1)):
     """
     Args:
         image: A 4-D tensor of shape
-            `[batch, in_height, in_width, in_channels]`.
+            `[batch, in_channels, in_height, in_width]`.
         kernels: A 4-D of shape
             `[batch, kernel_size[0], kernel_size[1], num_transformed_images]`.
 
     Returns:
         A list of `num_transformed_images` 4-D tensors, each of shape
-            `[batch, in_height, in_width, in_channels]`.
+            `[batch, in_channels, in_height, in_width]`.
     """
-    batch_size, height, width, color_channels = images.shape
+    #print('apply_cnda_kernels input: images  ',images.shape)  ### torch.Size([6, 3, 160, 320]) 6/2
+    #print('apply_cnda_kernels input: kernels  ',kernels.shape) ### 6/2
+    batch_size, color_channels, height, width = images.shape
     batch_size, kernel_height, kernel_width, num_transformed_images = kernels.shape
-    images = images.permute([3, 0, 1, 2])
+    images = images.permute([1, 0, 2, 3])
     kernels = kernels.permute([3, 0, 1, 2])
     images = torch.chunk(images, batch_size, dim=1)
     kernels = torch.chunk(kernels, batch_size, dim=1)
@@ -647,9 +727,14 @@ def apply_cdna_kernels(images, kernels, dilation_rate=(1, 1)):
         outputs.append(output)
     ### outputs = NCC'HW 5/30
     outputs = torch.cat(outputs, dim=0)
+    #print('apply_cnda_kernels: output_cat  ', outputs.shape)   ### 6/2
     outputs = outputs.reshape([batch_size, color_channels, num_transformed_images, height, width])
     outputs = outputs.permute([2, 0, 1, 3, 4])  ### C'NCHW 5/30
-    outputs = torch.split(outputs, 1, dim=0)
+    #print('apply_cnda_kernels: output_rehsape  ', outputs.shape)  ### 6/2
+    outputs = list(torch.split(outputs, 1, dim=0))
+    for i in range(len(outputs)):
+        outputs[i] = torch.squeeze(outputs[i])
+    #print('apply_cnda_kernels: output_split  ',len(outputs),outputs[0].shape)  ### 6/2
     return outputs
     
 

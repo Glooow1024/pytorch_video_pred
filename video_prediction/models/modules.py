@@ -19,17 +19,17 @@ from video_prediction.layers.conv import Conv2d, Conv3d
 class Dense(nn.Module):
     ### 相当于一个线性单元，units是输出的特征数 5/16
     ### inputs.shape=[batch_size,-1] 5/9
-    def __init__(self, input_shape, units=1, use_spectral_norm=False, use_bias=True):
+    def __init__(self, in_channels, out_channels=1, use_spectral_norm=False, use_bias=True):
         super(Dense, self).__init__()
-        self.units = units
-        self.input_shape = input_shape
-        self.kernel_shape = [input_shape[1], units]
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_shape = [in_channels, out_channels]
         self.use_spectral_norm = use_spectral_norm
         self.use_bias = use_bias
         ### 标准差设为0.02 5/9
         self.kernel = nn.Parameter(torch.randn(self.kernel_shape, dtype=torch.float32, requires_grad=True) * 0.02)
         if use_bias:
-            self.bias = nn.Parameter(torch.zeros(size=[self.units], dtype=torch.float32, requires_grad=True))
+            self.bias = nn.Parameter(torch.zeros(size=[self.out_channels], dtype=torch.float32, requires_grad=True))
         else:
             self.register_parameter('bias', None)
         
@@ -130,9 +130,8 @@ class ImageDiscriminator(nn.Module):
                             use_spectral_norm=True)
         
         ### dense 的 input_shape 受到前面卷积层的影响，暂时无法确定 5/19
-        #ln = torch.prod(self.input_shape[1:])   ### 去掉第一个维度后余下所有维度尺寸的乘积 5/19
-        #dense_input_shape = [self.input_shape[0], ln]
-        #self.dense = Dense(dense_input_shape, units=1, use_spectral_norm=True)
+        #in_channel = torch.prod(self.input_shape[1:])   ### 去掉第一个维度后余下所有维度尺寸的乘积 5/19
+        #self.dense = Dense(in_channel, out_channels=1, use_spectral_norm=True)
         self.dense = None
         
         
@@ -163,8 +162,7 @@ class ImageDiscriminator(nn.Module):
         output = output.reshape([output.shape[0],-1])   ### to [batch, -1] 5/19
         if self.dense is None:
             output_shape = output.shape
-            dense_input_shape = [output_shape[0], torch.prod(output_shape[1:])]
-            self.dense = Dense(dense_input_shape, units=1, use_spectral_norm=True)
+            self.dense = Dense(in_channels=torch.prod(output_shape[1:]), out_channels=1, use_spectral_norm=True)
         output = self.dense(output)
         outputs['output'] = output
         return outputs
@@ -202,8 +200,7 @@ class VideoDiscriminator(nn.Module):
         ### input_shape 不确定 5/19
         #from functools import reduce
         #ln = reduce(lambda x,y:x * y, self.input_shape[1:])
-        #dense_input_shape = [self.input_shape[0], ln]
-        #self.dense = Dense(dense_input_shape, units=1, use_spectral_norm=True)
+        #self.dense = Dense(ln, out_channels=1, use_spectral_norm=True)
         self.dense = None
         
         
@@ -234,8 +231,7 @@ class VideoDiscriminator(nn.Module):
         output = output.reshape([output.shape[0],-1])   ### to [batch, -1] 5/19
         if self.dense is None:
             output_shape = output.shape
-            dense_input_shape = [output_shape[0], torch.prod(output_shape[1:])]
-            self.dense = Dense(dense_input_shape, units=1, use_spectral_norm=True)
+            self.dense = Dense(in_channels=torch.prod(output_shape[1:]), out_channels=1, use_spectral_norm=True)
         output = self.dense(output)
         outputs['output'] = output
         return outputs
@@ -263,10 +259,9 @@ class Posterior(nn.Module):
                 self.rnn = nn.GRU(hidden_size=hparams.nef * 4)
             else:
                 raise NotImplementedError'''   ### 暂时去掉 5/19
-        out_shape = [np.prod(self.input_shape[0:2]),
-                     hparams.nef * min(4, 2**(hparams.n_layers-1))]
-        self.dense1 = Dense(input_shape=out_shape, units=hparams.nz)  ### input_shape要改 5/15
-        self.dense2 = Dense(input_shape=out_shape, units=hparams.nz)  ### input_shape要改 5/15
+        in_channel = hparams.nef * min(4, 2**(hparams.n_layers-1))
+        self.dense1 = Dense(in_channels=in_channel, out_channels=hparams.nz)  ### input_shape要改 5/15
+        self.dense2 = Dense(in_channels=in_channel, out_channels=hparams.nz)  ### input_shape要改 5/15
         
     def forward(self, inputs):   ### 参数千万不要忘了 self! 5/22
         ### inputs应当是 NDCHW 5/16
@@ -311,7 +306,7 @@ class Prior(nn.Module):
         dense_input_shape = encoder_out_shape
         dense_input_shape[0] += hparams.sequence_length - hparams.context_frames
         dense_input_shape = [np.prod(dense_input_shape[0:2])] + dense_input_shape[2:]
-        self.dense0 = Dense(input_shape=dense_input_shape, units=hparams.nef * 4)
+        self.dense0 = Dense(in_channels=dense_input_shape[1], out_channels=hparams.nef * 4)
         
         ### lstm input 应为 (seq_len, batch, input_size) 5/22
         rnn_input_shape = self.concat_shape[0:2]+[hparams.nef * 4]
@@ -326,10 +321,10 @@ class Prior(nn.Module):
             self.rnn = nn.GRU(input_size=hparams.nef * 4, hidden_size=hparams.nef * 4)
         else:
             raise NotImplementedError
-        rnn_output_shape = self.concat_shape[0:2]+[hparams.nef * 4]
-        dense_input_shape = [np.prod(rnn_output_shape[0:2])] + rnn_output_shape[2:]
-        self.dense1 = Dense(input_shape=dense_input_shape, units=hparams.nz)  ### input_shape要改 5/16
-        self.dense2 = Dense(input_shape=dense_input_shape, units=hparams.nz)  ### input_shape要改 5/16
+        #rnn_output_shape = self.concat_shape[0:2]+[hparams.nef * 4]
+        #dense_input_shape = [np.prod(rnn_output_shape[0:2])] + rnn_output_shape[2:]
+        self.dense1 = Dense(in_channels=hparams.nef * 4, out_channels=hparams.nz)  ### input_shape要改 5/16
+        self.dense2 = Dense(in_channels=hparams.nef * 4, out_channels=hparams.nz)  ### input_shape要改 5/16
         
     def forward(self, inputs):
         ### inputs应当是 DNCHW 5/22
