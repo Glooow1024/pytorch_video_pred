@@ -11,15 +11,115 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import collections
 from collections import OrderedDict
 from tensorflow.contrib.training import HParams
 from video_prediction.utils import util
-from video_prediction.utils.max_sv import spectral_normed_weight
-from video_prediction.layers.conv import Conv2d, Conv3d
+#from video_prediction.utils.max_sv import spectral_normed_weight
+#from video_prediction.layers.conv import Conv2d, Conv3d
 from video_prediction.layers.convLSTM import ConvLSTMCell
-from video_prediction.models.modules import Prior, Posterior, Dense, Encoder
+from video_prediction.models.modules import Dense, Prior, Posterior, Encoder, ImageDiscriminator, VideoDiscriminator
 
 
+### 测试基本通过 6/5
+### video_discrim 的 N 和 D 维度似乎反了 6/5
+class DiscriminatorGivenVideo(nn.Module):
+    ### input = DNCHW
+    ### input_shape = CHW 6/5
+    def __init__(self, input_shape, hparams):
+        super(DiscriminatorGivenVideo, self).__init__()
+        self.input_shape = list(input_shape)
+        self.hparams = hparams
+        self.clip_length = hparams.clip_length
+        
+        self.image_discrim_0 = ImageDiscriminator(input_shape[-3:], ndf=hparams.ndf)
+        self.image_discrim_1 = ImageDiscriminator(input_shape[-3:], ndf=hparams.ndf)
+        ### video_discrim  input_shape = CDHW 6/5
+        video_discrim_input_shape = [self.input_shape[-3]] + [self.clip_length] + self.input_shape[-2:]
+        self.video_discrim_1 = VideoDiscriminator(video_discrim_input_shape, ndf=hparams.ndf)
+        
+        
+    def forward(self, inputs):
+        ### inputs是来自generator的outputs['gen_images'] 6/5
+        ### inputs.shape = DNCHW 6/5
+        sequence_length, batch_size = inputs.shape[:2]
+        
+        ### 每个序列都随机抽取一帧送入 discriminator 6/5
+        t_sample = torch.randint(high=sequence_length, size=(batch_size,))
+        samples = torch.split(inputs, 1, dim=1)
+        #image_sample = torch.cat([torch.index_select(sample, dim=0, index = torch.tensor([idx]))
+        #                for idx,sample in zip(t_sample,samples)], dim=1)
+        image_sample = torch.cat([sample[idx] for idx,sample in zip(t_sample,samples)], dim=0)
+        
+        ### 每个序列采样一个子序列送入 discriminator 6/5
+        ### 同时再将序列中的每个图片送入 discriminator 6/5
+        t_start = torch.randint(high=sequence_length - self.clip_length + 1, size=(batch_size,))
+        clip_sample = torch.cat([sample[idx:idx+self.clip_length] for idx,sample in zip(t_start,samples)], dim=1)
+        
+        outputs = {}
+        if self.hparams.image_sn_gan_weight or self.hparams.image_sn_vae_gan_weight:
+            image_features = self.image_discrim_0(image_sample)
+            image_features, image_logits = image_features[:-1], image_features[-1]
+            outputs['discrim_image_sn_logits'] = image_logits
+            for i, image_feature in enumerate(image_features):
+                outputs['discrim_image_sn_feature%d' % i] = image_feature
+        if self.hparams.video_sn_gan_weight or self.hparams.video_sn_vae_gan_weight:
+            #print(clip_sample.permute(1,2,0,3,4).shape)  ### 6/
+            video_features = self.video_discrim_1(clip_sample.permute(1,2,0,3,4))  ### DNCHW TO NCDHW 6/5
+            video_features, video_logits = video_features[:-1], video_features[-1]
+            outputs['discrim_video_sn_logits'] = video_logits
+            for i, video_feature in enumerate(video_features):
+                outputs['discrim_video_sn_feature%d' % i] = video_feature
+        if self.hparams.images_sn_gan_weight or self.hparams.images_sn_vae_gan_weight:
+            clip_sample_shape = clip_sample.shape
+            images_features = self.image_discrim_1(clip_sample.reshape([-1]+list(clip_sample_shape[-3:])))
+            images_features = [feature.reshape(list(clip_sample_shape[0:2])+list(feature.shape[1:])) 
+                              for feature in images_features]
+            images_features, images_logits = images_features[:-1], images_features[-1]
+            for i, images_feature in enumerate(images_features):
+                outputs['discrim_images_sn_feature%d' % i] = images_feature
+        
+        return outputs
+
+
+class Discriminator(nn.Module):
+    ### inputs = {'images':DNCHW,} 为输入图像 6/5
+    ### ouputs = {'gen_images_enc':DNCHW, } 为 generator 输出 6/5q
+    ### image_shape = CHW 6/5
+    def __init__(self, image_shape, mode, hparams):
+        super(Discriminator, self).__init__()
+        self.image_shape = image_shape
+        self.mode = mode
+        self.hparams = hparams
+        
+        self.discriminator = DiscriminatorGivenVideo(self.image_shape[-3:], hparams)
+        
+        
+    def forward(self, inputs, outputs):
+        images_enc_real = inputs['images'][1:]
+        images_enc_fake = outputs['gen_images_enc']
+        discrim_outputs_enc_real = self.discriminator(images_enc_real)
+        discrim_outputs_enc_fake = self.discriminator(images_enc_fake)
+        images_real = inputs['images'][1:]
+        images_fake = outputs['gen_images']
+        discrim_outputs_real = self.discriminator(images_real)
+        discrim_outputs_fake = self.discriminator(images_fake)
+        
+        discrim_outputs_real = OrderedDict([(k + '_real', v) for k, v in discrim_outputs_real.items()])
+        discrim_outputs_fake = OrderedDict([(k + '_fake', v) for k, v in discrim_outputs_fake.items()])
+        discrim_outputs_enc_real = OrderedDict([(k + '_enc_real', v) for k, v in discrim_outputs_enc_real.items()])
+        discrim_outputs_enc_fake = OrderedDict([(k + '_enc_fake', v) for k, v in discrim_outputs_enc_fake.items()])
+        
+        outputs = [discrim_outputs_real, discrim_outputs_fake,
+                   discrim_outputs_enc_real, discrim_outputs_enc_fake]
+        total_num_outputs = sum([len(output) for output in outputs])
+        outputs = collections.OrderedDict(itertools.chain(*[output.items() for output in outputs]))
+        assert len(outputs) == total_num_outputs  # ensure no output is lost because of repeated keys
+        return outputs
+    
+
+
+### 6/3 测试完毕
 class SAVPCell(nn.Module):
     ### 假定 input_shape={'images':NCHW, 'zs':(N,nz)} 5/27
     ### 假定这里的 images 和 zs 都是经过 unroll_rnn 拆分过的 5/27
@@ -204,6 +304,8 @@ class SAVPCell(nn.Module):
         ### for cdna kernel, 忽略其他transformation 5/27
         self.cdna_kernel_shape = list(self.hparams.kernel_size) + \
                     [self.hparams.last_frames * self.hparams.num_transformed_images]
+        #self.cdna = nn.Linear(in_features=self.cdna_dense_in_channel,
+        #                  out_features=torch.prod(torch.Tensor(self.cdna_kernel_shape)))
         self.cdna = Dense(in_channels=self.cdna_dense_in_channel,
                           out_channels=torch.prod(torch.tensor(self.cdna_kernel_shape)))
         
@@ -477,7 +579,7 @@ class GeneratorGivenZ(nn.Module):
         
         
     def forward(self, inputs):
-        inputs = {name: maybe_pad_or_slice(input, self.hparams.sequence_length - 1)
+        inputs = {name: util.maybe_pad_or_slice(input, self.hparams.sequence_length - 1)
               for name, input in inputs.items()}
         batch_size = inputs['images'].shape[1]
         #print('GeneratorGivenZ inputs[images]  ',inputs['images'].shape)
@@ -527,12 +629,13 @@ class GeneratorGivenZ(nn.Module):
         for k,v in outputs.items():
             outputs[k] = torch.stack(outputs[k], dim=0)
             
-        print('GeneratorGivenZ outputs')
-        for k,v in outputs.items():
-            print(k, v.shape)
-        print('-'*20)
+        #print('GeneratorGivenZ outputs')
+        #for k,v in outputs.items():
+        #    print(k, v.shape)
+        #print('-'*20)
         #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes)
         return outputs
+
 
 
 ### 编写于 5/23
@@ -571,10 +674,10 @@ class Generator(nn.Module):
                     torch.sqrt(torch.exp(outputs_posterior['zs_log_sigma_sq'])) * eps
             inputs_posterior = inputs
             inputs_posterior['zs'] = zs_posterior
-            print('Generator : inputs_posterior')
-            for k, v in inputs_posterior.items():
-                print(k, v.shape)
-            print('-'*20)
+            #print('Generator : inputs_posterior')
+            #for k, v in inputs_posterior.items():
+            #    print(k, v.shape)
+            #print('-'*20)
             
             ### 生成 prior 5/23
             if self.hparams.learn_prior:
@@ -589,16 +692,16 @@ class Generator(nn.Module):
                 zs_prior = torch.cat([zs_posterior[:self.hparams.context_frames - 1], zs_prior], dim=0)
             inputs_prior = inputs
             inputs_prior['zs'] = zs_prior
-            print('Generator : inputs_prior')
-            for k, v in inputs_prior.items():
-                print(k, v.shape)
-            print('-'*20)
+            #print('Generator : inputs_prior')
+            #for k, v in inputs_prior.items():
+            #    print(k, v.shape)
+            #print('-'*20)
             
             ### posterior 和 images 交给 generator 5/23
             gen_outputs_posterior = self.generator(inputs_posterior)
-            print('-'*20,' gen posterior complete ','-'*20)
+            #print('-'*20,' gen posterior complete ','-'*20)
             gen_outputs = self.generator(inputs_prior)
-            print('-'*20,' gen prior complete ','-'*20)
+            #print('-'*20,' gen prior complete ','-'*20)
             
             # rename tensors to avoid name collisions
             output_prior = collections.OrderedDict([(k + '_prior', v) for k, v in outputs_prior.items()])
@@ -620,10 +723,10 @@ class Generator(nn.Module):
                                 self.hparams.num_samples,
                                 self.batch_size,
                                 self.hparams.nz]
-            print('Generator : inputs_samples')
-            for k,v in inputs_samples.items():
-                print(k, v.shape)
-            print('-'*20)
+            #print('Generator : inputs_samples')
+            #for k,v in inputs_samples.items():
+            #    print(k, v.shape)
+            #print('-'*20)
             if self.hparams.learn_prior:
                 eps = torch.randn(zs_samples_shape)
                 zs_prior_samples = (outputs_prior['zs_mu'][:, None] +
@@ -644,8 +747,8 @@ class Generator(nn.Module):
             gen_outputs_samples = self.generator(inputs_prior_samples)
             gen_images_samples = gen_outputs_samples['gen_images']
             ### 再恢复出前两个维度 5/23
-            print('Generator samples')
-            print('Generator : gen_images_Samples  ',gen_images_samples.shape)
+            #print('Generator samples')
+            #print('Generator : gen_images_Samples  ',gen_images_samples.shape)
             gen_images_samples = torch.stack(gen_images_samples.chunk(self.hparams.num_samples, dim=1), dim=-1)
             gen_images_samples_avg = torch.mean(gen_images_samples, dim=-1)
             outputs['gen_images_samples'] = gen_images_samples

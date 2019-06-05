@@ -11,11 +11,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn.utils import spectral_norm
 
 from video_prediction.utils.util import maybe_pad_or_slice
-from video_prediction.utils.max_sv import spectral_normed_weight
-from video_prediction.layers.conv import Conv2d, Conv3d
+#from video_prediction.utils.max_sv import spectral_normed_weight
+#from video_prediction.layers.conv import Conv2d, Conv3d
 
+### 可用 spectral_norm(nn.Linear()) 代替 6/5
 class Dense(nn.Module):
     ### 相当于一个线性单元，units是输出的特征数 5/16
     ### inputs.shape=[batch_size,-1] 5/9
@@ -103,31 +105,25 @@ class Encoder(nn.Module):
     
 class ImageDiscriminator(nn.Module):
     ### input 为 NCHW 5/19
+    ### input_shape = CHW 6/5
     def __init__(self, input_shape, ndf=64):
         super(ImageDiscriminator, self).__init__()
         self.input_shape = input_shape
-        self.batch_size = input_shape[0]
-        self.conv0 = Conv2d(in_channels=self.input_shape[-3],
-                            out_channels=ndf, kernel_size=3, stride=1, padding=(0,0,1,1),
-                            use_spectral_norm=True)
-        self.conv1 = Conv2d(in_channels=ndf,
-                            out_channels=ndf*2, kernel_size=4, stride=2, padding=(0,0,1,1),
-                            use_spectral_norm=True)
-        self.conv2 = Conv2d(in_channels=ndf*2,
-                            out_channels=ndf*2, kernel_size=3, stride=1, padding=(0,0,1,1),
-                            use_spectral_norm=True)
-        self.conv3 = Conv2d(in_channels=ndf*2,
-                            out_channels=ndf*4, kernel_size=4, stride=2, padding=(0,0,1,1),
-                            use_spectral_norm=True)
-        self.conv4 = Conv2d(in_channels=ndf*4,
-                            out_channels=ndf*4, kernel_size=3, stride=1, padding=(0,0,1,1),
-                            use_spectral_norm=True)
-        self.conv5 = Conv2d(in_channels=ndf*4,
-                            out_channels=ndf*8, kernel_size=4, stride=2, padding=(0,0,1,1),
-                            use_spectral_norm=True)
-        self.conv6 = Conv2d(in_channels=ndf*8,
-                            out_channels=ndf*8, kernel_size=3, stride=1, padding=(0,0,1,1),
-                            use_spectral_norm=True)
+        #self.batch_size = input_shape[0]  ### 6/5
+        self.conv0 = spectral_norm(nn.Conv2d(in_channels=self.input_shape[-3],
+                            out_channels=ndf, kernel_size=3, stride=1, padding=(1,1)))
+        self.conv1 = spectral_norm(nn.Conv2d(in_channels=ndf,
+                            out_channels=ndf*2, kernel_size=4, stride=2, padding=(1,1)))
+        self.conv2 = spectral_norm(nn.Conv2d(in_channels=ndf*2,
+                            out_channels=ndf*2, kernel_size=3, stride=1, padding=(1,1)))
+        self.conv3 = spectral_norm(nn.Conv2d(in_channels=ndf*2,
+                            out_channels=ndf*4, kernel_size=4, stride=2, padding=(1,1)))
+        self.conv4 = spectral_norm(nn.Conv2d(in_channels=ndf*4,
+                            out_channels=ndf*4, kernel_size=3, stride=1, padding=(1,1)))
+        self.conv5 = spectral_norm(nn.Conv2d(in_channels=ndf*4,
+                            out_channels=ndf*8, kernel_size=4, stride=2, padding=(1,1)))
+        self.conv6 = spectral_norm(nn.Conv2d(in_channels=ndf*8,
+                            out_channels=ndf*8, kernel_size=3, stride=1, padding=(1,1)))
         
         ### dense 的 input_shape 受到前面卷积层的影响，暂时无法确定 5/19
         #in_channel = torch.prod(self.input_shape[1:])   ### 去掉第一个维度后余下所有维度尺寸的乘积 5/19
@@ -137,65 +133,69 @@ class ImageDiscriminator(nn.Module):
         
     def forward(self, inputs):
         ### inputs 应当是 NCHW 5/8
-        outputs = {}
+        #outputs = {}
+        outputs = []
         output = self.conv0(inputs)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv0_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv0_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv1(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv0_1'] = output     ### for visualization 5/8
+        #outputs['sn_conv0_1'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv2(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv1_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv1_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv3(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv1_1'] = output     ### for visualization 5/8
+        #outputs['sn_conv1_1'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv4(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv2_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv2_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv5(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv2_1'] = output     ### for visualization 5/8
+        #outputs['sn_conv2_1'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv6(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv3_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv3_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = output.reshape([output.shape[0],-1])   ### to [batch, -1] 5/19
         if self.dense is None:
             output_shape = output.shape
-            self.dense = Dense(in_channels=torch.prod(output_shape[1:]), out_channels=1, use_spectral_norm=True)
+            self.dense = spectral_norm(nn.Linear(in_features=torch.prod(torch.tensor(output_shape[1:])),
+                                                 out_features=1))
         output = self.dense(output)
-        outputs['output'] = output
+        #outputs['output'] = output
+        outputs.append(output)
         return outputs
     
 class VideoDiscriminator(nn.Module):
-    ### 原代码中要求 input_shape=TBHWC 5/9
-    ### 这里设为 NCDHW 5/9
+    ### 原代码中要求 input_shape=DNHWC 5/9
+    ### 这里设为 input = NCDHW 5/9
+    ### input_shape = CDHW 6/5
     def __init__(self, input_shape, ndf=64):
         super(VideoDiscriminator, self).__init__()
         self.input_shape = input_shape
-        self.batch_size = input_shape[0]
+        #self.batch_size = input_shape[0]
         ### conv3d的输入为 NCDHW 
-        self.conv0 = Conv3d(in_channels=self.input_shape[1],
-                            out_channels=ndf, kernel_size=3, stride=1, padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
-        self.conv1 = Conv3d(in_channels=ndf,
-                            out_channels=ndf*2, kernel_size=4, stride=(1,2,2), padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
-        self.conv2 = Conv3d(in_channels=ndf*2,
-                            out_channels=ndf*2, kernel_size=3, stride=1, padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
-        self.conv3 = Conv3d(in_channels=ndf*2,
-                            out_channels=ndf*4, kernel_size=4, stride=(1,2,2), padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
-        self.conv4 = Conv3d(in_channels=ndf*4,
-                            out_channels=ndf*4, kernel_size=3, stride=1, padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
-        self.conv5 = Conv3d(in_channels=ndf*4,
-                            out_channels=ndf*8, kernel_size=4, stride=2, padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
-        self.conv6 = Conv3d(in_channels=ndf*8,
-                            out_channels=ndf*8, kernel_size=3, stride=1, padding=(0,0,1,1,1),
-                            use_spectral_norm=True)
+        self.conv0 = spectral_norm(nn.Conv3d(in_channels=self.input_shape[-4],
+                            out_channels=ndf, kernel_size=3, stride=1, padding=(1,1,1)))
+        self.conv1 = spectral_norm(nn.Conv3d(in_channels=ndf,
+                            out_channels=ndf*2, kernel_size=4, stride=(1,2,2), padding=(1,1,1)))
+        self.conv2 = spectral_norm(nn.Conv3d(in_channels=ndf*2,
+                            out_channels=ndf*2, kernel_size=3, stride=1, padding=(1,1,1)))
+        self.conv3 = spectral_norm(nn.Conv3d(in_channels=ndf*2,
+                            out_channels=ndf*4, kernel_size=4, stride=(1,2,2), padding=(1,1,1)))
+        self.conv4 = spectral_norm(nn.Conv3d(in_channels=ndf*4,
+                            out_channels=ndf*4, kernel_size=3, stride=1, padding=(1,1,1)))
+        self.conv5 = spectral_norm(nn.Conv3d(in_channels=ndf*4,
+                            out_channels=ndf*8, kernel_size=4, stride=2, padding=(1,1,1)))
+        self.conv6 = spectral_norm(nn.Conv3d(in_channels=ndf*8,
+                            out_channels=ndf*8, kernel_size=3, stride=1, padding=(1,1,1)))
         
         ### input_shape 不确定 5/19
         #from functools import reduce
@@ -206,34 +206,44 @@ class VideoDiscriminator(nn.Module):
         
     def forward(self, inputs):
         ### inputs 应当是 NCDHW 5/8
-        outputs = {}
+        #outputs = {}
+        outputs = []
         output = self.conv0(inputs)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv0_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv0_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv1(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv0_1'] = output     ### for visualization 5/8
+        #outputs['sn_conv0_1'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv2(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv1_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv1_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv3(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv1_1'] = output     ### for visualization 5/8
+        #outputs['sn_conv1_1'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv4(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv2_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv2_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv5(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv2_1'] = output     ### for visualization 5/8
+        #outputs['sn_conv2_1'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = self.conv6(output)
         output = F.leaky_relu(output, negative_slope=0.1)
-        outputs['sn_conv3_0'] = output     ### for visualization 5/8
+        #outputs['sn_conv3_0'] = output     ### for visualization 5/8
+        outputs.append(output)
         output = output.reshape([output.shape[0],-1])   ### to [batch, -1] 5/19
         if self.dense is None:
             output_shape = output.shape
-            self.dense = Dense(in_channels=torch.prod(output_shape[1:]), out_channels=1, use_spectral_norm=True)
+            self.dense = spectral_norm(nn.Linear(in_features=torch.prod(torch.tensor(output_shape[1:])),
+                                                 out_features=1))
         output = self.dense(output)
-        outputs['output'] = output
+        #outputs['output'] = output
+        outputs.append(output)
         return outputs
     
 ### 编写于5/15

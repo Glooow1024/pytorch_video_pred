@@ -15,6 +15,7 @@ from torch.nn.modules.utils import _single, _pair, _triple  # from .utils import
 from torch._jit_internal import weak_module, weak_script_method, List  # from ..._jit_internal import weak_module, weak_script_method, List
 
 from video_prediction.utils.max_sv import spectral_normed_weight
+#from torch.nn.utils import spectral_norm(module, name='weight', n_power_iterations=1, eps=1e-12, dim=None)
 
 @weak_module
 class _ConvNd(Module):
