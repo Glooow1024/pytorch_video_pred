@@ -9,8 +9,12 @@ import h5py
 from collections import OrderedDict
 
 import numpy as np
-from tensorflow.contrib.training import HParams
+import torch
 import torch.utils.data as data
+from tensorflow.contrib.training import HParams
+
+import video_prediction.globalvar as gl
+device = gl.get_value()
 
 class BaseVideoDataset(data.Dataset):
     def __init__(self, input_dir, mode='train', num_epochs=None, seed=None,
@@ -30,7 +34,7 @@ class BaseVideoDataset(data.Dataset):
                 These values overrides any values in hparams_dict (if any).
 
         Note:
-            self.input_dir is the directory containing the tfrecords.
+            self.input_dir is the directory containing the h5.
         """
         self.input_dir = os.path.normpath(os.path.expanduser(input_dir))
         self.mode = mode
@@ -68,9 +72,16 @@ class BaseVideoDataset(data.Dataset):
         ### 含有 'images','speed','angle'
         ### 其中 images.sahpe = (30,160,320,3) 
         f = h5py.File(self.filenames[index], 'r')
-        sample = dict(f)
+        '''sample = dict(f)
+        #sample['images'] = sample.pop('image')
         for k in sample.keys():   ### 将h5文件中的dataset数据类型转化为np类型
             sample[k] = f[k].value.astype(np.float32)
+            #if k is not 'images':
+            #    sample.pop(k)'''
+        sample = {}
+        #sample['images'] = torch.tensor(f['image'].value.astype(np.float32)).cuda(device)
+        sample['images'] = f['image'].value.astype(np.float32)
+        sample['images'] = torch.tensor(sample['images'])
         f.close()
         return sample
     
@@ -106,11 +117,11 @@ class BaseVideoDataset(data.Dataset):
         hparams = dict(
             crop_size=0,
             scale_size=0,
-            context_frames=1,
-            sequence_length=0,
-            long_sequence_length=0,
+            context_frames=2,
+            sequence_length=12,
+            long_sequence_length=30,
+            time_shift=2,
             frame_skip=0,
-            time_shift=1,
             force_time_shift=False,
             shuffle_on_val=False,
             use_state=False,
@@ -138,6 +149,8 @@ class BaseVideoDataset(data.Dataset):
         raise NotImplementedError
 
     def set_sequence_length(self, sequence_length):
+        if not sequence_length:
+            sequence_length = (self._max_sequence_length - 1) // (self.hparams.frame_skip + 1) + 1
         self.hparams.sequence_length = sequence_length
 
     #def filter(self, serialized_example):
@@ -276,6 +289,8 @@ class BaseVideoDataset(data.Dataset):
         raise NotImplementedError
 
 
+### 暂时丢弃 6/8
+'''
 class VideoDataset(BaseVideoDataset):
     """
     This class supports reading tfrecords where a sequence is stored as
@@ -308,32 +323,4 @@ class VideoDataset(BaseVideoDataset):
         ### self.state_like_names_and_shapes.items() 和 self.action_like_names_and_shapes.items()是什么东西？ 5/4
         ### state_like_seqs 和 action_like_seqs 又是什么东西？ 5/4
         raise NotImplementedError
-        
-if __name__ == '__main__':
-    ### 测试用,训练时不会执行下面的代码 5/4
-    import cv2
-    from video_prediction import datasets
-
-    datasets = [
-        datasets.SV2PVideoDataset('data/shape', mode='val'),
-        datasets.SV2PVideoDataset('data/humans', mode='val'),
-        datasets.SoftmotionVideoDataset('data/bair', mode='val'),
-        datasets.KTHVideoDataset('data/kth', mode='val'),
-        datasets.KTHVideoDataset('data/kth_128', mode='val'),
-        #datasets.UCF101VideoDataset('data/ucf101', mode='val'),  ###我删的2019/3/3
-    ]
-    batch_size = 4
-
-    for dataset in datasets:
-        inputs = dataset.make_batch(batch_size)
-        images = inputs['images']
-        images = tf.reshape(images, [-1] + images.get_shape().as_list()[2:])
-        images = sess.run(images)
-        images = (images * 255).astype(np.uint8)
-        for image in images:
-            if image.shape[-1] == 1:
-                image = np.tile(image, [1, 1, 3])
-            else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            cv2.imshow(dataset.input_dir, image)
-            cv2.waitKey(50)
+        '''

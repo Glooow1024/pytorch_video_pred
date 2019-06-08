@@ -7,6 +7,8 @@ import torch.nn as nn
 from torch.autograd import Variable
 import torch
 
+import video_prediction.globalvar as gl
+device = gl.get_value()   ### 获取全局device 6/8
 
 class ConvLSTMCell(nn.Module):
 
@@ -63,8 +65,8 @@ class ConvLSTMCell(nn.Module):
         return h_next, c_next
 
     def init_hidden(self, batch_size):
-        return (Variable(torch.zeros(batch_size, self.hidden_dim, self.height, self.width)).cuda(),
-                Variable(torch.zeros(batch_size, self.hidden_dim, self.height, self.width)).cuda())
+        return (Variable(torch.zeros(batch_size, self.hidden_dim, self.height, self.width)).cuda(device),
+                Variable(torch.zeros(batch_size, self.hidden_dim, self.height, self.width)).cuda(device))
 
 
 class ConvLSTM(nn.Module):

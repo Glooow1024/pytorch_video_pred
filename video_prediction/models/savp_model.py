@@ -14,12 +14,15 @@ import torch.optim as optim
 import collections
 from collections import OrderedDict
 from tensorflow.contrib.training import HParams
+import video_prediction as vp
 from video_prediction.utils import util
 #from video_prediction.utils.max_sv import spectral_normed_weight
 #from video_prediction.layers.conv import Conv2d, Conv3d
 from video_prediction.layers.convLSTM import ConvLSTMCell
 from video_prediction.models.modules import Dense, Prior, Posterior, Encoder, ImageDiscriminator, VideoDiscriminator
 
+import video_prediction.globalvar as gl
+device = gl.get_value()   ### 获取全局device 6/8
 
 ### 测试基本通过 6/5
 ### video_discrim 的 N 和 D 维度似乎反了 6/5
@@ -42,10 +45,11 @@ class DiscriminatorGivenVideo(nn.Module):
     def forward(self, inputs):
         ### inputs是来自generator的outputs['gen_images'] 6/5
         ### inputs.shape = DNCHW 6/5
+        inputs = inputs.cuda(device)   ### 6/8
         sequence_length, batch_size = inputs.shape[:2]
         
         ### 每个序列都随机抽取一帧送入 discriminator 6/5
-        t_sample = torch.randint(high=sequence_length, size=(batch_size,))
+        t_sample = torch.randint(high=sequence_length, size=(batch_size,)).cuda(device)  ### cuda 6/8
         samples = torch.split(inputs, 1, dim=1)
         #image_sample = torch.cat([torch.index_select(sample, dim=0, index = torch.tensor([idx]))
         #                for idx,sample in zip(t_sample,samples)], dim=1)
@@ -53,7 +57,7 @@ class DiscriminatorGivenVideo(nn.Module):
         
         ### 每个序列采样一个子序列送入 discriminator 6/5
         ### 同时再将序列中的每个图片送入 discriminator 6/5
-        t_start = torch.randint(high=sequence_length - self.clip_length + 1, size=(batch_size,))
+        t_start = torch.randint(high=sequence_length - self.clip_length + 1, size=(batch_size,)).cuda(device)  ### 6/8
         clip_sample = torch.cat([sample[idx:idx+self.clip_length] for idx,sample in zip(t_start,samples)], dim=1)
         
         outputs = {}
@@ -76,12 +80,14 @@ class DiscriminatorGivenVideo(nn.Module):
             images_features = [feature.reshape(list(clip_sample_shape[0:2])+list(feature.shape[1:])) 
                               for feature in images_features]
             images_features, images_logits = images_features[:-1], images_features[-1]
+            outputs['discrim_images_sn_logits'] = images_logits
             for i, images_feature in enumerate(images_features):
                 outputs['discrim_images_sn_feature%d' % i] = images_feature
         
         return outputs
 
 
+### 测试通过 6/6
 class Discriminator(nn.Module):
     ### inputs = {'images':DNCHW,} 为输入图像 6/5
     ### ouputs = {'gen_images_enc':DNCHW, } 为 generator 输出 6/5q
@@ -96,8 +102,10 @@ class Discriminator(nn.Module):
         
         
     def forward(self, inputs, outputs):
-        images_enc_real = inputs['images'][1:]
-        images_enc_fake = outputs['gen_images_enc']
+        #inputs = {k:v.cuda(device) for k,v in inputs.items()}   ### 6/8
+        #outputs = {k:v.cuda(device) for k,v in outputs.items()}
+        images_enc_real = inputs['images'][1:]#.cuda(device)     ### 6/8
+        images_enc_fake = outputs['gen_images_enc']#.cuda(device)
         discrim_outputs_enc_real = self.discriminator(images_enc_real)
         discrim_outputs_enc_fake = self.discriminator(images_enc_fake)
         images_real = inputs['images'][1:]
@@ -137,10 +145,12 @@ class SAVPCell(nn.Module):
         
         ############### latent code ###############
         ### LSTMCell inputs 应当是 (batch_size,input_size) 5/28
-        self.lstm_z = nn.LSTMCell(input_size=self.input_shape['zs'][1], hidden_size=self.hparams.nz)
+        self.lstm_z = nn.LSTMCell(input_size=self.input_shape['zs'][-1], hidden_size=self.hparams.nz)
         self.rnn_z_state_sizes = [self.hparams.nz]  ### [self.batch_size, self.hparams.nz] 6/3
         
         self.scale_size = min(height, width)
+        print(height, width)   ### 6/8
+        print(self.scale_size)
         if self.scale_size >= 256:
             raise NotImplementedError
         elif self.scale_size >=128:
@@ -150,7 +160,7 @@ class SAVPCell(nn.Module):
             ### 第 0 层 5/26
             ### conv_pool + norm + activation 5/26
             conv_rnn_height, conv_rnn_width = conv_rnn_height//2, conv_rnn_width//2
-            in_channel = self.input_shape['images'][1]*2 + self.hparams.nz
+            in_channel = self.input_shape['images'][-3]*2 + self.hparams.nz
             out_channel = self.hparams.ngf
             ### 记录 conv rnn states 的 shape，便于初始化 6/1
             ### 注意初始化时要有两个相同shape的state，分别是 h 和 c 6/1
@@ -566,14 +576,14 @@ class GeneratorGivenZ(nn.Module):
     def __init__(self, input_shape, mode, hparams):
         super(GeneratorGivenZ, self).__init__()
         self.input_shape = input_shape
-        self.image_shape = list(input_shape['images'][2:])
+        self.image_shape = list(input_shape['images'][-3:])
         self.time_length = hparams.sequence_length - 1
         self.hparams = hparams
         self.mode = mode
         
         savp_input_shape = {}
-        savp_input_shape['images'] = list(input_shape['images'][1:])
-        savp_input_shape['zs'] = list(input_shape['zs'][1:])
+        savp_input_shape['images'] = list(input_shape['images'][-3:])
+        savp_input_shape['zs'] = list(input_shape['zs'][-1:])
         #print('GeneratorGivenZ: savp_input_shape  ',savp_input_shape)
         self.savpcell = SAVPCell(savp_input_shape, mode, hparams)
         
@@ -591,7 +601,7 @@ class GeneratorGivenZ(nn.Module):
         ### initial state 6/1
         states = {}
         states['time'] = 0
-        states['gen_image'] = torch.zeros(self.image_shape)
+        states['gen_image'] = torch.zeros(self.image_shape).cuda(device)  ### 6/8
         states['last_images'] = [inputs['images'][0]] * self.hparams.last_frames
         #print(self.savpcell.rnn_z_state_sizes)
         rnn_z_state_size = [batch_size] + self.savpcell.rnn_z_state_sizes
@@ -602,8 +612,9 @@ class GeneratorGivenZ(nn.Module):
         for i in range(len(conv_rnn_state_size)):
             conv_rnn_state_size[i] = [batch_size] + conv_rnn_state_size[i]
         #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes[0])
-        states['rnn_z_state'] = (torch.zeros(rnn_z_state_size),torch.zeros(rnn_z_state_size))
-        states['conv_rnn_states'] = [(torch.zeros(conv_rnn_state_sz),torch.zeros(conv_rnn_state_sz))
+        states['rnn_z_state'] = (torch.zeros(rnn_z_state_size).cuda(device),torch.zeros(rnn_z_state_size).cuda(device))
+        states['conv_rnn_states'] = [(torch.zeros(conv_rnn_state_sz).cuda(device),
+                                      torch.zeros(conv_rnn_state_sz).cuda(device))
                                     for conv_rnn_state_sz in conv_rnn_state_size]
         
         #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes[0])
@@ -629,17 +640,17 @@ class GeneratorGivenZ(nn.Module):
         for k,v in outputs.items():
             outputs[k] = torch.stack(outputs[k], dim=0)
             
-        #print('GeneratorGivenZ outputs')
-        #for k,v in outputs.items():
-        #    print(k, v.shape)
-        #print('-'*20)
+        print('GeneratorGivenZ outputs')
+        for k,v in outputs.items():
+            print(k, v.shape)
+        print('-'*20)
         #print('GeneratorGivenZ : self.savpcell.con_rnn_state_sizes[0]  ',self.savpcell.conv_rnn_state_sizes)
         return outputs
 
 
 
 ### 编写于 5/23
-### 待测试。。。 5/23
+### 测试完毕 6/8
 class Generator(nn.Module):
     ### inputs DNCHW 5/23
     def __init__(self, input_shape, mode, hparams):
@@ -647,9 +658,9 @@ class Generator(nn.Module):
         self.mode = mode
         self.hparams = hparams
         self.input_shape = input_shape
-        self.batch_size = input_shape[1]
+        #self.batch_size = input_shape[1]
         
-        self.zs_shape = [hparams.sequence_length - 1, self.batch_size, hparams.nz]
+        self.zs_shape = [hparams.sequence_length - 1, hparams.nz]
         self.encoder = Posterior(input_shape, hparams)
         if hparams.learn_prior:
             self.prior = Prior(input_shape, hparams)
@@ -658,18 +669,23 @@ class Generator(nn.Module):
         posterior_shape = {}
         posterior_shape['images'] = input_shape
         posterior_shape['zs'] = [input_shape[0]-1, input_shape[1], hparams.nz]
-        self.generator = GeneratorGivenZ(input_shape=posterior_shape, mode=mode, hparams=hparams)  ### 待完成 5/23
+        self.generator = GeneratorGivenZ(input_shape=posterior_shape, mode=mode, hparams=hparams)
         
     def forward(self, images):
         inputs = {}
-        inputs['images'] = images
+        inputs['images'] = images  ### DNCHW 6/8
+        batch_size = images.shape[1]   ### 6/8
+        zs_shape = [self.zs_shape[0]] + [batch_size] + [self.zs_shape[1]]
         if self.hparams.nz == 0:
             outputs = self.generator(inputs)
         else:
             ### encoder 生成 posterior  5/23
             outputs_posterior = self.encoder(inputs['images'])
             #print(outputs_posterior)
-            eps = torch.randn(self.zs_shape)
+            eps = torch.randn(zs_shape).cuda(device)   ### cuda 6/8
+            #print(type(outputs_posterior['zs_mu'])) ### 6/8
+            #print(type(outputs_posterior['zs_log_sigma_sq']))
+            #print(type(eps))
             zs_posterior = outputs_posterior['zs_mu'] + \
                     torch.sqrt(torch.exp(outputs_posterior['zs_log_sigma_sq'])) * eps
             inputs_posterior = inputs
@@ -682,13 +698,13 @@ class Generator(nn.Module):
             ### 生成 prior 5/23
             if self.hparams.learn_prior:
                 outputs_prior = self.prior(inputs['images'])
-                eps = torch.randn(self.zs_shape)
+                eps = torch.randn(zs_shape).cuda(device)   ### cuda 6/8
                 zs_prior = outputs_prior['zs_mu'] + \
                     torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq'])) * eps
             else:
                 outputs_prior = {}
                 zs_prior = torch.randn([self.hparams.sequence_length - self.hparams.context_frames] + \
-                                       self.zs_shape[1:])
+                                       zs_shape[1:]).cuda(device)  ### 6/8
                 zs_prior = torch.cat([zs_posterior[:self.hparams.context_frames - 1], zs_prior], dim=0)
             inputs_prior = inputs
             inputs_prior['zs'] = zs_prior
@@ -721,19 +737,19 @@ class Generator(nn.Module):
                 for name, input in inputs.items()}
             zs_samples_shape = [self.hparams.sequence_length - 1,
                                 self.hparams.num_samples,
-                                self.batch_size,
+                                batch_size,
                                 self.hparams.nz]
             #print('Generator : inputs_samples')
             #for k,v in inputs_samples.items():
             #    print(k, v.shape)
             #print('-'*20)
             if self.hparams.learn_prior:
-                eps = torch.randn(zs_samples_shape)
+                eps = torch.randn(zs_samples_shape).cuda(device)
                 zs_prior_samples = (outputs_prior['zs_mu'][:, None] +
                                 torch.sqrt(torch.exp(outputs_prior['zs_log_sigma_sq']))[:, None] * eps)
             else:
                 zs_prior_samples = torch.randn(
-                    [self.hparams.sequence_length - self.hparams.context_frames] + zs_samples_shape[1:])
+                    [self.hparams.sequence_length - self.hparams.context_frames] + zs_samples_shape[1:]).cuda(device)
                 zs_prior_samples = torch.cat(
                     [zs_posterior[:self.hparams.context_frames - 1][:, None].repeat(
                                   [1, self.hparams.num_samples, 1, 1]),
@@ -773,7 +789,7 @@ def identity_kernel(kernel_size):
 
     kernel[center_slice(kh), center_slice(kw)] = 1.0
     kernel /= np.sum(kernel)
-    return torch.FloatTensor(kernel)
+    return torch.FloatTensor(kernel).cuda(device)
         
 def apply_kernels(image, kernels, dilation_rate=(1, 1)):
     """
@@ -836,7 +852,8 @@ def apply_cdna_kernels(images, kernels, dilation_rate=(1, 1)):
     #print('apply_cnda_kernels: output_rehsape  ', outputs.shape)  ### 6/2
     outputs = list(torch.split(outputs, 1, dim=0))
     for i in range(len(outputs)):
-        outputs[i] = torch.squeeze(outputs[i])
+        #print(outputs[i].shape)  ### 6/8
+        outputs[i] = torch.squeeze(outputs[i],dim=0)
     #print('apply_cnda_kernels: output_split  ',len(outputs),outputs[0].shape)  ### 6/2
     return outputs
     
@@ -844,43 +861,31 @@ def apply_cdna_kernels(images, kernels, dilation_rate=(1, 1)):
     
 
 ### 融合BaseVideoPredModel 和 VideoPredModel 5/15
-class BaseVideoPredictionModel(nn.Module):
-    def __init__(self, mode='train', hparams_dict=None, hparams=None,
+class SAVPModel(nn.Module):
+    ### input_shape = NDHWC 6/8
+    def __init__(self, input_shape, mode='train', hparams_dict=None, hparams=None,
                  num_gpus=None, eval_num_samples=100,
                  eval_num_samples_for_diversity=10, eval_parallel_iterations=1,
                  aggregate_nccl=False,
                  **kwargs):
-        """
-        Base video prediction model.
-
-        Trainable and non-trainable video prediction models can be derived
-        from this base class.
-
-        Args:
-            mode: `'train'` or `'test'`.
-            hparams_dict: a dict of `name=value` pairs, where `name` must be
-                defined in `self.get_default_hparams()`.
-            hparams: a string of comma separated list of `name=value` pairs,
-                where `name` must be defined in `self.get_default_hparams()`.
-                These values overrides any values in hparams_dict (if any).
-        """
-        super(BaseVideoPredictionModel, self).__init__()
+        super(SAVPModel, self).__init__()
+        self.input_shape = [input_shape[1],input_shape[0],input_shape[4]] + list(input_shape[2:4])  ### 6/8
         if mode not in ('train', 'test'):
             raise ValueError('mode must be train or test, but %s given' % mode)
         self.mode = mode
-        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
-        if cuda_visible_devices == '':
-            max_num_gpus = 0
-        else:
-            max_num_gpus = len(cuda_visible_devices.split(','))
-        if num_gpus is None:
-            num_gpus = max_num_gpus
-        elif num_gpus > max_num_gpus:
-            raise ValueError('num_gpus=%d is greater than the number of visible devices %d' % (num_gpus, max_num_gpus))
-        self.num_gpus = num_gpus
-        self.eval_num_samples = eval_num_samples
-        self.eval_num_samples_for_diversity = eval_num_samples_for_diversity
-        self.eval_parallel_iterations = eval_parallel_iterations
+        #cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '0')  ### 6/8
+        #if cuda_visible_devices == '':
+        #    max_num_gpus = 0
+        #else:
+        #    max_num_gpus = len(cuda_visible_devices.split(','))
+        #if num_gpus is None:
+        #    num_gpus = max_num_gpus
+        #elif num_gpus > max_num_gpus:
+        #    raise ValueError('num_gpus=%d is greater than the number of visible devices %d' % (num_gpus, max_num_gpus))
+        #self.num_gpus = num_gpus
+        #self.eval_num_samples = eval_num_samples
+        #self.eval_num_samples_for_diversity = eval_num_samples_for_diversity
+        #self.eval_parallel_iterations = eval_parallel_iterations
         self.hparams = self.parse_hparams(hparams_dict, hparams)
         if self.hparams.context_frames == -1:
             raise ValueError('Invalid context_frames %r. It might have to be '
@@ -903,26 +908,50 @@ class BaseVideoPredictionModel(nn.Module):
         self.saveable_variables = None
         self.post_init_ops = None
         
-        self.generator = Generator(mode=self.mode, hparams=self.hparams)
-        if self.discrm:
-            self.discriminator = VideoDiscriminator(discriminator_fn, mode=self.mode, hparams=self.hparams)
-        else:
-            self.discriminator = None
-        self.aggregate_nccl = aggregate_nccl
+        self.generator = Generator(input_shape=self.input_shape, mode=self.mode, hparams=self.hparams)
+        #if self.discrm:   ### 先去掉。。。 6/8
+        #    self.discriminator = Discriminator(image_shape=self.input_shape[-3:], mode=self.mode, hparams=self.hparams)
+        #else:
+        #    self.discriminator = None
+        self.discriminator = Discriminator(image_shape=self.input_shape[-3:], mode=self.mode, hparams=self.hparams)
+        #self.aggregate_nccl = aggregate_nccl
         
-        ### 改自savp_model.py SAVPCell 5/16
-        self.encoder0 = Encoder
         
     ### inputs.shape=()? 5/15
+    ### inputs = {'images':NDHWC, }
+    ### outputs = {'':DNCHW}
     def forward(self, inputs):
+        inputs['images'] = inputs['images'].permute(1,0,4,2,3)   ### NDHWC to DNCHW 6/8
+        inputs['images'] = inputs['images'].to(device)
+        #images = inputs['images'].to(device)
         outputs = {}
-        output = self.generator(inputs)
-        outputs['gen_output'] = output
-        if self.discrim:
-            output = self.discriminator_fn(inputs, output)
-            outputs['discrim_output'] = output
-        
+        output = self.generator(inputs['images'])
+        outputs.update(output)
+        #if self.discrim:   ### 暂时忽略 6/8
+        #    output = self.discriminator(inputs, output)
+        #    outputs.update(output)
+        output = self.discriminator(inputs, output)
+        outputs.update(output)
+        outputs = OrderedDict(outputs)
         return outputs
+        
+    def loss(self, inputs, outputs):
+        ### inputs['images']=DNCHW 6/8
+        d_losses = self.discriminator_loss(inputs, outputs)
+        print('---discriminator_loss---')
+        for k,v in d_losses.items():
+            print(k,v)
+        
+        g_losses = self.generator_loss(inputs, outputs)
+        for k,v in g_losses.items():
+            print(k,v)
+        
+        g_losses_post = g_losses
+        
+        metrics = self.metrics_fn(inputs, outputs)
+        
+        
+        
         
         
     def get_default_hparams_dict(self):
@@ -943,8 +972,49 @@ class BaseVideoPredictionModel(nn.Module):
             repeat: the number of repeat actions (if applicable).
         """
         hparams = dict(
+            #l1_weight=1.0,
+            #l2_weight=0.0,
+            n_layers=3,  # 3改为5 5/21
+            ndf=32,
+            #norm_layer='instance',
+            use_same_discriminator=False,
+            ngf=32,
+            #downsample_layer='conv_pool2d',
+            #upsample_layer='upsample_conv2d',
+            #activation_layer='relu',  # for generator only
+            #transformation='cdna',
+            kernel_size=(5, 5),
+            dilation_rate=(1, 1),
+            #where_add='all',
+            use_tile_concat=True,
+            learn_initial_state=False,
+            #rnn='lstm',
+            #conv_rnn='lstm',
+            #conv_rnn_norm_layer='instance',
+            num_transformed_images=4,
+            last_frames=1,
+            prev_image_background=True,
+            first_image_background=True,
+            last_image_background=False,
+            last_context_image_background=False,
+            context_images_background=False,
+            generate_scratch_image=True,
+            dependent_mask=True,
+            #schedule_sampling='inverse_sigmoid',
+            #schedule_sampling_k=900.0,
+            #schedule_sampling_steps=(0, 100000),
+            use_e_rnn=False,
+            learn_prior=False,
+            nz=8,
+            num_samples=8,
+            nef=64,   ### 64改为32 5/21
+            use_rnn_z=True,
+            ablation_conv_rnn_norm=False,
+            ablation_rnn=False,
+            
             context_frames=-1,
             sequence_length=-1,
+            long_sequence_length=-1,
             repeat=1,
             batch_size=16,
             lr=0.001,
@@ -954,7 +1024,7 @@ class BaseVideoPredictionModel(nn.Module):
             max_steps=300000,
             beta1=0.9,
             beta2=0.999,
-            clip_length=10,
+            clip_length=4,   ### 10 改为 4 6/8
             l1_weight=0.0,
             l2_weight=1.0,
             vgg_cdist_weight=0.0,
@@ -966,8 +1036,8 @@ class BaseVideoPredictionModel(nn.Module):
             image_sn_vae_gan_weight=0.0,
             images_sn_gan_weight=0.0,
             images_sn_vae_gan_weight=0.0,
-            video_sn_gan_weight=0.0,
-            video_sn_vae_gan_weight=0.0,
+            video_sn_gan_weight=0.1,
+            video_sn_vae_gan_weight=0.1,
             gan_feature_l2_weight=0.0,
             gan_feature_cdist_weight=0.0,
             vae_gan_feature_l2_weight=0.0,
@@ -994,4 +1064,189 @@ class BaseVideoPredictionModel(nn.Module):
                 parsed_hparams.parse(hparam)
         return parsed_hparams
     
+    def discriminator_loss(self, inputs, outputs):
+        ### inputs['images']=DNCHW 6/8
+        hparams = self.hparams
+        discrim_losses = OrderedDict()
+        
+        gan_weights = {'_image_sn': hparams.image_sn_gan_weight,
+                       '_images_sn': hparams.images_sn_gan_weight,
+                       '_video_sn': hparams.video_sn_gan_weight}
+        for infix, gan_weight in gan_weights.items():
+            if gan_weight:
+                discrim_gan_loss_real = vp.losses.gan_loss(outputs['discrim%s_logits_real' % infix],
+                                                           1.0, hparams.gan_loss_type)
+                discrim_gan_loss_fake = vp.losses.gan_loss(outputs['discrim%s_logits_fake' % infix],
+                                                           0.0, hparams.gan_loss_type)
+                discrim_gan_loss = discrim_gan_loss_real + discrim_gan_loss_fake
+                discrim_losses["discrim%s_gan_loss" % infix] = (discrim_gan_loss, gan_weight)
+        
+        vae_gan_weights = {'_image_sn': hparams.image_sn_vae_gan_weight,
+                           '_images_sn': hparams.images_sn_vae_gan_weight,
+                           '_video_sn': hparams.video_sn_vae_gan_weight}
+        for infix, vae_gan_weight in vae_gan_weights.items():
+            if vae_gan_weight:
+                discrim_vae_gan_loss_real = vp.losses.gan_loss(outputs['discrim%s_logits_enc_real' % infix],
+                                                               1.0, hparams.gan_loss_type)
+                discrim_vae_gan_loss_fake = vp.losses.gan_loss(outputs['discrim%s_logits_enc_fake' % infix],
+                                                               0.0, hparams.gan_loss_type)
+                discrim_vae_gan_loss = discrim_vae_gan_loss_real + discrim_vae_gan_loss_fake
+                discrim_losses["discrim%s_vae_gan_loss" % infix] = (discrim_vae_gan_loss, vae_gan_weight)
+                
+        return discrim_losses
     
+    def generator_loss(self, inputs, outputs):
+        ### inputs['images']=DNCHW 6/8
+        hparams = self.hparams
+        gen_losses = OrderedDict()
+        if hparams.l1_weight or hparams.l2_weight or hparams.vgg_cdist_weight:
+            gen_images = outputs.get('gen_images_enc', outputs['gen_images'])
+            target_images = inputs['images'][1:]
+        if hparams.l1_weight:
+            gen_l1_loss = vp.losses.l1_loss(gen_images, target_images)
+            gen_losses["gen_l1_loss"] = (gen_l1_loss, hparams.l1_weight)
+        if hparams.l2_weight:
+            gen_l2_loss = vp.losses.l2_loss(gen_images, target_images)
+            gen_losses["gen_l2_loss"] = (gen_l2_loss, hparams.l2_weight)
+        
+        gan_weights = {'_image_sn': hparams.image_sn_gan_weight,
+                       '_images_sn': hparams.images_sn_gan_weight,
+                       '_video_sn': hparams.video_sn_gan_weight}
+        for infix, gan_weight in gan_weights.items():
+            if gan_weight:
+                gen_gan_loss = vp.losses.gan_loss(outputs['discrim%s_logits_fake' % infix],
+                                                  1.0, hparams.gan_loss_type)
+                gen_losses["gen%s_gan_loss" % infix] = (gen_gan_loss, gan_weight)
+            if gan_weight and (hparams.gan_feature_l2_weight or hparams.gan_feature_cdist_weight):
+                i_feature = 0
+                discrim_features_fake = []
+                discrim_features_real = []
+                while True:
+                    discrim_feature_fake = outputs.get('discrim%s_feature%d_fake' % (infix, i_feature))
+                    discrim_feature_real = outputs.get('discrim%s_feature%d_real' % (infix, i_feature))
+                    if discrim_feature_fake is None or discrim_feature_real is None:
+                        break
+                    discrim_features_fake.append(discrim_feature_fake)
+                    discrim_features_real.append(discrim_feature_real)
+                    i_feature += 1
+                
+                if hparams.gan_feature_cdist_weight:
+                    gen_gan_feature_cdist_loss = sum([
+                        vp.losses.cosine_distance(discrim_feature_fake, discrim_feature_real)
+                        for discrim_feature_fake, discrim_feature_real
+                        in zip(discrim_features_fake, discrim_features_real)])
+                    gen_losses["gen%s_gan_feature_cdist_loss" % infix] = \
+                        (gen_gan_feature_cdist_loss, hparams.gan_feature_cdist_weight)
+                
+        vae_gan_weights = {'_image_sn': hparams.image_sn_vae_gan_weight,
+                           '_images_sn': hparams.images_sn_vae_gan_weight,
+                           '_video_sn': hparams.video_sn_vae_gan_weight}
+        for infix, vae_gan_weight in vae_gan_weights.items():
+            if vae_gan_weight:
+                gen_vae_gan_loss = vp.losses.gan_loss(outputs['discrim%s_logits_enc_fake' % infix],
+                                                      1.0, hparams.gan_loss_type)
+                gen_losses["gen%s_vae_gan_loss" % infix] = (gen_vae_gan_loss, vae_gan_weight)
+            if vae_gan_weight and (hparams.vae_gan_feature_l2_weight or hparams.vae_gan_feature_cdist_weight):
+                i_feature = 0
+                discrim_features_enc_fake = []
+                discrim_features_enc_real = []
+                while True:
+                    discrim_feature_enc_fake = outputs.get('discrim%s_feature%d_enc_fake' % (infix, i_feature))
+                    discrim_feature_enc_real = outputs.get('discrim%s_feature%d_enc_real' % (infix, i_feature))
+                    if discrim_feature_enc_fake is None or discrim_feature_enc_real is None:
+                        break
+                    discrim_features_enc_fake.append(discrim_feature_enc_fake)
+                    discrim_features_enc_real.append(discrim_feature_enc_real)
+                    i_feature += 1
+                if hparams.vae_gan_feature_l2_weight:
+                    gen_vae_gan_feature_l2_loss = sum([
+                        vp.losses.l2_loss(discrim_feature_enc_fake, discrim_feature_enc_real) 
+                        for discrim_feature_enc_fake, discrim_feature_enc_real
+                        in zip(discrim_features_enc_fake, discrim_features_enc_real)])
+                    gen_losses["gen%s_vae_gan_feature_l2_loss" % infix] = \
+                        (gen_vae_gan_feature_l2_loss, hparams.vae_gan_feature_l2_weight)
+                if hparams.vae_gan_feature_cdist_weight:
+                    gen_vae_gan_feature_cdist_loss = sum([
+                        vp.losses.cosine_distance(discrim_feature_enc_fake, discrim_feature_enc_real)
+                        for discrim_feature_enc_fake, discrim_feature_enc_real
+                        in zip(discrim_features_enc_fake, discrim_features_enc_real)])
+                    gen_losses["gen%s_vae_gan_feature_cdist_loss" % infix] = \
+                        (gen_vae_gan_feature_cdist_loss, hparams.vae_gan_feature_cdist_weight)
+        
+        if hparams.kl_weight:
+            gen_kl_loss = vp.losses.kl_loss(outputs['zs_mu_enc'], outputs['zs_log_sigma_sq_enc'],
+                                outputs.get('zs_mu_prior'), outputs.get('zs_log_sigma_sq_prior'))
+            gen_losses["gen_kl_loss"] = (gen_kl_loss, self.kl_weight)  # possibly annealed kl_weight
+        
+        return gen_losses
+        
+    def metrics_fn(self, inputs, outputs):
+        ### inputs['images']=DNCHW 6/8
+        metrics = OrderedDict()
+        sequence_length = inputs['images'].shape[0]
+        context_frames = self.hparams.context_frames
+        future_length = sequence_length - context_frames
+        # target_images and pred_images include only the future frames
+        target_images = inputs['images'][-future_length:]
+        pred_images = outputs['gen_images'][-future_length:]
+        metric_fns = [
+            ('psnr', vp.metrics.psnr),    ### 待完成。。。 6/8
+            ('mse', vp.metrics.mse),
+            ('ssim', vp.metrics.ssim),
+            ('lpips', vp.metrics.lpips),
+        ]
+        for metric_name, metric_fn in metric_fns:
+            metrics[metric_name] = torch.mean(metric_fn(target_images, pred_images))
+        return metrics
+        
+    def eval_outputs_and_metrics_fn(self, inputs, outputs, num_samples=None,
+                                    num_samples_for_diversity=None, parallel_iterations=None):
+        ### inputs['images']=DNCHW 6/8
+        num_samples = num_samples or self.eval_num_samples
+        num_samples_for_diversity = num_samples_for_diversity or self.eval_num_samples_for_diversity
+        parallel_iterations = parallel_iterations or self.eval_parallel_iterations
+        
+        sequence_length, batch_size = list(inputs['images'].shape[:2])
+        if batch_size is None:
+            batch_size = tf.shape(inputs['images'])[1]
+        if sequence_length is None:
+            sequence_length = tf.shape(inputs['images'])[0]
+        context_frames = self.hparams.context_frames
+        future_length = sequence_length - context_frames
+        # the outputs include all the frames, whereas the metrics include only the future frames
+        eval_outputs = OrderedDict()
+        eval_metrics = OrderedDict()
+        metric_fns = [
+            ('psnr', vp.metrics.psnr),
+            ('mse', vp.metrics.mse),
+            ('ssim', vp.metrics.ssim),
+            ('lpips', vp.metrics.lpips),
+        ]
+        # images and gen_images include all the frames
+        images = inputs['images']
+        gen_images = outputs['gen_images']
+        # target_images and pred_images include only the future frames
+        target_images = inputs['images'][-future_length:]
+        pred_images = outputs['gen_images'][-future_length:]
+        # ground truth is the same for deterministic and stochastic models
+        eval_outputs['eval_images'] = images
+        if self.deterministic:
+            for metric_name, metric_fn in metric_fns:
+                metric = metric_fn(target_images, pred_images)
+                eval_metrics['eval_%s/min' % metric_name] = metric
+                eval_metrics['eval_%s/avg' % metric_name] = metric
+                eval_metrics['eval_%s/max' % metric_name] = metric
+            eval_outputs['eval_gen_images'] = gen_images
+        else:
+            def transpose_batch_time(tensor):
+                return tensor.transpose(0,1)
+                
+            def where_axis1(cond, x, y):
+                return transpose_batch_time(torch.where(cond, transpose_batch_time(x), transpose_batch_time(y)))
+            
+            def accum_gen_images_and_metrics_fn(a, unused):
+                ### 待完成。。。 6/8
+                
+                
+                
+                
